@@ -1,9 +1,9 @@
 # audiowatch
 
-Tells you which process just put audio on one of this Mac's outputs — including
-a process that starts, plays and exits in a fraction of a second.
+Names the process that just put audio on one of this Mac's outputs.
 
-It never plays anything itself.
+* **Short-lived ones too**: a process that starts, plays and exits in a fraction of a second.
+* **Silent itself**: it never plays anything.
 
 ## Run it
 
@@ -12,16 +12,20 @@ cargo build --release
 ./target/release/audiowatch
 ```
 
-That watches until you stop it, printing events and posting a notification for
-anything that is not on the allow-list. To have it running all the time:
+* Watches until you stop it.
+* Prints events.
+* Posts a notification for anything not on the allow-list.
+
+### Running it all the time
 
 ```sh
 ./target/release/audiowatch --install-agent   # writes the LaunchAgent, prints the command
 ```
 
-It deliberately does not load the agent — it prints the `launchctl bootstrap`
-line for you to run. Copy the binary somewhere stable first (`/usr/local/bin`),
-because the plist points at wherever the binary was when you ran the command.
+* **It does not load the agent.** Deliberately.
+  * It prints the `launchctl bootstrap` line for you to run.
+* **Copy the binary somewhere stable first**, such as `/usr/local/bin`.
+  * The plist points at wherever the binary was when you ran the command.
 
 ## Everything else it does
 
@@ -45,16 +49,19 @@ audiowatch --paths           # where the config and log are
 | config | `~/.config/audiowatch/config.conf` |
 | agent | `~/Library/LaunchAgents/local.audiowatch.plist` |
 
-The log is the primary output. Each line is written and `fsync`ed **before** the
-notification is attempted, so a missed, dismissed or suppressed notification
-never loses the record. Tab-separated, backslash-escaped, one line per event:
+### The log
+
+* **The log is the primary output.**
+* Each line is written and `fsync`ed **before** the notification is attempted.
+  * A missed, dismissed or suppressed notification never loses the record.
+* **Format**: tab-separated, backslash-escaped, one line per event.
 
 ```
 epoch_ms  local_time  kind  disposition  pid  bundle  exe  devices  note
 ```
 
-`kind` is one of `connect`, `output-start`, `output-stop`, `input-start`,
-`input-stop`, `disconnect`, `baseline`. It rotates to `audiowatch.log.1` at 8 MB.
+* **`kind`**: one of `connect`, `output-start`, `output-stop`, `input-start`, `input-stop`, `disconnect`, `baseline`.
+* **Rotation**: to `audiowatch.log.1` at 8 MB.
 
 ## Stopping something from notifying you
 
@@ -66,108 +73,126 @@ allow-path   /Applications/Thing.app/*   # match the full executable path
 allow-bundle com.example.thing           # match the bundle id
 ```
 
-Patterns are case-insensitive; `*` matches anything, `?` matches one character.
-Then `launchctl kickstart -k gui/$(id -u)/local.audiowatch` if it is running as
-an agent.
+* Patterns are case-insensitive.
+  * `*` matches anything. `?` matches one character.
+* Running as an agent? Restart it: `launchctl kickstart -k gui/$(id -u)/local.audiowatch`.
 
-**An allow-listed event is still logged**, with the rule that suppressed it, so
-you can always go back and see what was hidden:
+### Allowed is not hidden
+
+**An allow-listed event is still logged**, with the rule that suppressed it. You can always go back and see what was hidden:
 
 ```
 11:43:30  output-start  Discord Helper  pid 81645  dev[Speakers] (allowed by path /Applications/Discord.app/*)
 ```
 
-The default list covers Chrome, Safari, Firefox, Arc, Brave, Edge, Spotify,
-Music, TV, Podcasts, QuickTime, VLC, IINA, Zoom, Slack, Discord, Teams,
-FaceTime, Messages and WhatsApp — matched on bundle id *and* on path, because a
-helper process usually has a path and no bundle id. The config file lists them
-all, with comments, and is the same text that ships as the defaults.
+### The default list
+
+* **Covers**: Chrome, Safari, Firefox, Arc, Brave, Edge, Spotify, Music, TV, Podcasts, QuickTime, VLC, IINA, Zoom, Slack, Discord, Teams, FaceTime, Messages and WhatsApp.
+* Matched on bundle id *and* on path.
+  * A helper process usually has a path and no bundle id.
+* The config file lists them all, with comments.
+  * It is the same text that ships as the defaults.
 
 ## How it detects the start of output
 
-Three CoreAudio facts, each measured on this machine (macOS 26.6.2) rather than
-taken from documentation:
+Three CoreAudio facts. Each was measured on this machine (macOS 26.6.2), not taken from documentation.
 
 | API | Sends notifications? |
 |---|---|
 | `kAudioHardwarePropertyProcessObjectList` | **yes**, within ~1 ms of a process connecting to the HAL |
-| `kAudioDevicePropertyDeviceIsRunningSomewhere` | **yes**, when IO starts on a device — but it cannot say which process |
+| `kAudioDevicePropertyDeviceIsRunningSomewhere` | **yes**, when IO starts on a device. It cannot say which process |
 | `kAudioProcessPropertyIsRunningOutput` | **no.** A listener registers successfully (`status 0`) and then never fires |
 
-So no single API answers the question, and the tool combines all three:
+**No single API answers the question.** So the tool combines all three:
 
-1. **The process object list listener is where identity is captured.** A process
-   connects to the HAL *before* it makes a sound — measured at 112–220 ms
-   before — and it is certainly still alive at that moment, so its pid,
-   executable path and bundle id are read and cached right then. This is what
-   lets an `output-start` still name a process that has since exited.
-2. **`IsRunningOutput` is polled**, every 50 ms, because it does not notify.
-   This is what actually detects output starting.
-3. **A device reporting IO** drops the poll to 10 ms for 2 seconds, to pin down
-   which process was responsible.
-4. **Every HAL connect is logged** even if output is never confirmed. A process
-   cannot make a sound without connecting first, so this is the backstop: worst
-   case you get "`/usr/bin/afplay` connected at 11:43:32.340 and was gone 214 ms
-   later", which is still the clue you needed.
+```mermaid
+flowchart LR
+  C[HAL connect<br/>ProcessObjectList listener] -->|pid, path, bundle id cached| E[output-start]
+  C -->|always| L[connect logged]
+  D[device IO starts<br/>DeviceIsRunningSomewhere] -->|poll at 10 ms for 2 s| P
+  P[IsRunningOutput<br/>polled every 50 ms] -->|0 to 1| E
+```
 
-Notifications go through `osascript`'s `display notification`, which needs no app
-bundle of our own and works from a LaunchAgent. It was verified by posting one
-and finding `usernoted` log the presentation 130 ms later. They carry **no
-sound**. `audiowatch --test-notify` repeats that check, and tells you to look at
-System Settings → Notifications → **Script Editor** if it fails — that is the app
-notifications are attributed to.
+1. **Identity is captured at the HAL connect**, by the process object list listener.
+   * A process connects *before* it makes a sound: measured at 112–220 ms before.
+   * It is **necessarily** still alive at that moment.
+   * So its pid, executable path and bundle id are read and cached right then.
+   * That is what lets an `output-start` name a process that has since exited.
+2. **`IsRunningOutput` is polled** every 50 ms, because it does not notify.
+   * This is what actually detects output starting.
+3. **A device reporting IO** drops the poll to 10 ms for 2 seconds.
+   * That pins down which process was responsible.
+4. **Every HAL connect is logged**, even if output is never confirmed.
+   * A process cannot make a sound without connecting first. This is the backstop.
+   * Worst case: "`/usr/bin/afplay` connected at 11:43:32.340 and was gone 214 ms later". Still the clue you needed.
+
+### Notifications
+
+* Posted through `osascript`'s `display notification`.
+  * Needs no app bundle of our own.
+  * Works from a LaunchAgent.
+* ✅ **Verified** by posting one: `usernoted` logged the presentation 130 ms later.
+* They carry **no sound**.
+* `audiowatch --test-notify` repeats that check.
+  * If it fails, it points you at System Settings → Notifications → **Script Editor**.
+  * That is the app notifications are attributed to.
 
 ### What it costs
 
-Measured on this machine: **0.7% of one core and 13 MB resident** at the default
-50 ms poll. An idle tick is two property reads per audio process and nothing
-else — identity and device lookups happen only when a flag actually moves, which
-is what keeps a permanently-resident watcher cheap.
+* Measured on this machine: **0.7% of one core and 13 MB resident**, at the default 50 ms poll.
+* An idle tick is two property reads per audio process. Nothing else.
+* Identity and device lookups happen only when a flag actually moves.
+  * That is what keeps a permanently-resident watcher cheap.
 
 ## What still gets past it
 
-Read this before trusting it.
+⚠️ Read this before trusting it.
 
-- **A process that holds an output stream open permanently.** Detection is on
-  the *transition* of `IsRunningOutput` from 0 to 1. A process that opens an
-  output stream at login and keeps it open, writing silence most of the time and
-  occasionally writing something audible, never transitions and is never
-  reported. On this machine `arkaudiod` (Audio Routing Kit) is exactly this
-  shape: permanently running output on MacBook Pro Speakers, both BlackHole
-  devices and the LG display. **If the noise arrives through ARK, Loopback,
-  BlackHole or JACK, audiowatch will attribute it to the bridge, or not see it
-  at all.** These are deliberately *not* on the default allow-list.
-- **Sounds played on another process's behalf.** `systemsoundserverd` plays UI
-  and alert sounds for other apps, so you will see `systemsoundserverd` and not
-  whoever asked. Same for `PowerChime` (the charger sound) and `audiomxd`.
-- **Anything that is not a HAL client process at all** — the boot chime, which
-  is firmware, and audio generated inside a HAL plug-in driver rather than by a
-  client.
-- **Which channels.** CoreAudio's per-process API reports the *devices* a
-  process is running on, and there is no per-channel attribution in it. So
-  audiowatch names the device and `--devices` gives its channel count, but it
-  cannot say "channels 3–4 of the Scarlett".
-- **A gap shorter than the poll.** A process whose output stream is open for
-  less than 50 ms could fall between two polls. In practice the window is far
-  longer than the sound, because a process opens the device, plays, and lingers:
-  across 13 measured `afplay` runs of 100–500 ms files, the shortest output
-  window was **524 ms** — ten times the poll interval. Lower `poll-ms` for more
-  margin.
-- **`DeviceIsRunningSomewhere` will not fire for a device something else already
-  holds.** It is a per-device flag, not a per-process one, so when `arkaudiod`
-  already has MacBook Pro Speakers running, a second process starting output on
-  that device changes nothing and no notification arrives. On this machine
-  several devices are permanently running, so **the poll is the real detector
-  and the device listener is only an accelerator** — do not raise `poll-ms` far
-  on the assumption that the listener will cover it.
-- **A process that exits before its path can be read**, in which case the pid
-  and bundle id are still logged and the note says the path was never readable.
+* **A process that holds an output stream open permanently.**
+  * Detection is on the *transition* of `IsRunningOutput` from 0 to 1.
+  * Open at login, kept open, mostly silence, occasionally audible: it never transitions and is never reported.
+  * On this machine `arkaudiod` (Audio Routing Kit) is exactly this shape.
+    * Permanently running output on MacBook Pro Speakers, both BlackHole devices and the LG display.
+  * **If the noise arrives through ARK, Loopback, BlackHole or JACK, audiowatch will attribute it to the bridge, or not see it at all.**
+  * These are deliberately *not* on the default allow-list.
+  * The lever: a process tap, below.
+* **Sounds played on another process's behalf.**
+  * `systemsoundserverd` plays UI and alert sounds for other apps.
+  * You see `systemsoundserverd`, not whoever asked.
+  * Same for `PowerChime` (the charger sound) and `audiomxd`.
+* **Anything that is not a HAL client process at all.**
+  * The boot chime, which is firmware.
+  * Audio generated inside a HAL plug-in driver rather than by a client.
+* **Which channels.**
+  * CoreAudio's per-process API reports the *devices* a process is running on.
+  * It has no per-channel attribution.
+  * So audiowatch names the device, and `--devices` gives its channel count.
+  * It cannot say "channels 3–4 of the Scarlett".
+* **A gap shorter than the poll.**
+  * An output stream open for less than 50 ms **possibly** falls between two polls.
+  * In practice the window is far longer than the sound: a process opens the device, plays, and lingers.
+  * Across 13 measured `afplay` runs of 100–500 ms files, the shortest output window was **524 ms**.
+    * Ten times the poll interval.
+  * Want more margin? Lower `poll-ms`.
+* **A device something else already holds.**
+  * `DeviceIsRunningSomewhere` is a per-device flag, not a per-process one.
+  * When `arkaudiod` already has MacBook Pro Speakers running, a second process starting output there changes nothing.
+    * No notification arrives.
+  * On this machine several devices are permanently running.
+  * **So the poll is the real detector. The device listener is only an accelerator.**
+  * Do not raise `poll-ms` far on the assumption that the listener will cover it.
+* **A process that exits before its path can be read.**
+  * The pid and bundle id are still logged.
+  * The note says the path was never readable.
 
-If the watcher comes up empty, the escalation is a **process tap**
-(`kAudioTapClassID` / `CATapDescription`, in the same headers), which can measure
-the actual signal a process produces rather than whether it is running IO. That
-would see audio passing through a permanently-open stream, which is the one case
-above that matters most.
+### The escalation: a process tap
+
+* If the watcher comes up empty, the next step is a **process tap**.
+  * `kAudioTapClassID` / `CATapDescription`, in the same headers.
+* It measures the actual signal a process produces, not whether it is running IO.
+* So it would see audio passing through a permanently-open stream.
+  * That is the gap above that matters most.
+* Started, not finished: see [Status](#status-done-2026-09-26).
 
 ## Layout
 
@@ -184,26 +209,29 @@ above that matters most.
 | `src/notify.rs` | notifications, and checking they arrived |
 | `src/agent.rs` | the LaunchAgent plist |
 
-No dependencies. `cargo test` covers the encoding, the filter rules, the log
-reader, the CLI, the time parsing and the whole state machine including the
-short-lived-process case; the CoreAudio callbacks are covered by hand, as
-described above.
+* **No dependencies.**
+* `cargo test` covers the encoding, the filter rules, the log reader, the CLI and the time parsing.
+  * Also the whole state machine, including the short-lived-process case.
+* The CoreAudio callbacks are covered by hand, as described above.
 
 ## The process tree
 
-`afplay` on its own is meaningless — half the machine plays a sound that way.
-`afplay ← zsh ← claude` is the whole answer. So every record carries the chain
-above the process, and it is walked **when the process connects to the HAL**,
-not when its output is noticed: a process connects 113–321 ms before it makes a
-sound, and by the time a 200 ms burst is seen its parents can be gone too.
+* **`afplay` on its own is meaningless.** Half the machine plays a sound that way.
+* **`afplay ← zsh ← claude` is the whole answer.**
+* So every record carries the chain above the process.
+* It is walked **when the process connects to the HAL**, not when its output is noticed.
+  * A process connects 113–321 ms before it makes a sound.
+  * By the time a 200 ms burst is seen, its parents can be gone too.
 
 ```
 12:10:39  output-start  afplay   pid 87533  ← zsh ← claude  dev[Speakers]
 ```
 
-Nearest ancestor first, stopping at `launchd`, depth-capped at 12 with a cycle
-guard. The short form shows three; the log line carries the whole chain with
-every path, and `--now` prints all of it.
+* Nearest ancestor first, stopping at `launchd`.
+* Depth-capped at 12, with a cycle guard.
+* **The short form shows three.**
+  * The log line carries the whole chain, with every path.
+  * `--now` prints all of it.
 
 ### `allow-ancestor`
 
@@ -214,28 +242,36 @@ allow-ancestor claude          # anything my agent sessions spawn
 allow-ancestor /opt/homebrew/* # or by where it lives
 ```
 
-This is the rule that makes the difference between a useful watcher and a
-useless one. `afplay` is how everything plays a sound, so excusing `afplay`
-would hide everything — including the noise you built this to find. Excusing
-*what started it* does not. An ancestor whose path could not be read matches no
-rule: a bare pid is not an identity to trust a rule against.
+* **This rule is what makes the watcher useful.**
+* `afplay` is how everything plays a sound.
+  * Excusing `afplay` would hide everything, including the noise you built this to find.
+  * Excusing *what started it* does not.
+* An ancestor whose path could not be read matches no rule.
+  * A bare pid is not an identity to trust a rule against.
 
-## Status — done (2026-09-26)
+## Status: done (2026-09-26)
 
-Chris: *"audiowatch can be considered done."* The detector, the log, the filter,
-the notifications and the process tree are finished, gated and installed at
-`~/.local/bin/audiowatch`. Nothing is running: the LaunchAgent is written and
-**not loaded**, so it does nothing until you bootstrap it.
+Chris: *"audiowatch can be considered done."*
+
+* ✅ **Done**: the detector, the log, the filter, the notifications and the process tree.
+  * Finished, gated and installed at `~/.local/bin/audiowatch`.
+* **Nothing is running.**
+  * The LaunchAgent is written and **not loaded**.
+  * It does nothing until you bootstrap it.
 
 ```sh
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.audiowatch.plist
 launchctl bootout   gui/$(id -u)/local.audiowatch    # and to stop it
 ```
 
-**The process tap was started and is not finished.** `src/tap.rs` and
-`src/bridge.rs` are in the tree, unreferenced, marked `#[allow(dead_code)]` item
-by item. They are the escalation described in *What would still slip past it*:
-they would see audio passing through a **permanently open** stream, which is the
-one failure mode this tool cannot detect, and the shape `arkaudiod` has on this
-machine. Nothing else depends on them; they are kept rather than deleted so that
-route is a resumption rather than a rewrite.
+### Not yet constructed: the process tap
+
+* **The process tap was started and is not finished.**
+* `src/tap.rs` and `src/bridge.rs` are in the tree.
+  * Unreferenced, marked `#[allow(dead_code)]` item by item.
+* They are the escalation described in [What still gets past it](#what-still-gets-past-it).
+* They would see audio passing through a **permanently open** stream.
+  * The one failure mode this tool cannot detect.
+  * The shape `arkaudiod` has on this machine.
+* Nothing else depends on them.
+* Kept rather than deleted, so that route is a resumption, not a rewrite.
