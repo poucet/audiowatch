@@ -50,6 +50,8 @@ pub const PROP_PROCESS_IS_RUNNING_OUTPUT: Selector = fourcc(b"piro");
 
 // Devices.
 pub const PROP_DEVICE_IS_RUNNING_SOMEWHERE: Selector = fourcc(b"gone");
+pub const PROP_TAP_UID: Selector = fourcc(b"tuid");
+pub const PROP_TAP_FORMAT: Selector = fourcc(b"tfmt");
 pub const PROP_DEVICE_UID: Selector = fourcc(b"uid ");
 pub const PROP_STREAM_CONFIGURATION: Selector = fourcc(b"slay");
 
@@ -81,6 +83,62 @@ impl PropertyAddress {
 pub type ListenerProc =
     extern "C" fn(AudioObjectId, u32, *const PropertyAddress, *mut c_void) -> OsStatus;
 
+/// `AudioBuffer` — one buffer of interleaved samples.
+#[repr(C)]
+pub struct AudioBuffer {
+    pub number_channels: u32,
+    pub data_byte_size: u32,
+    pub data: *mut c_void,
+}
+
+/// `AudioBufferList` — a count followed by that many `AudioBuffer`s inline.
+#[repr(C)]
+pub struct AudioBufferList {
+    pub number_buffers: u32,
+    pub buffers: [AudioBuffer; 1],
+}
+
+/// `AudioTimeStamp`. Only its size and layout matter here; the IOProc never
+/// reads it, but it must be the right size for the ABI.
+#[repr(C)]
+pub struct AudioTimeStamp {
+    pub sample_time: f64,
+    pub host_time: u64,
+    pub rate_scalar: f64,
+    pub word_clock_time: u64,
+    pub smpte_time: [u8; 16],
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+/// `AudioStreamBasicDescription`, as returned by `kAudioTapPropertyFormat`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct StreamBasicDescription {
+    pub sample_rate: f64,
+    pub format_id: u32,
+    pub format_flags: u32,
+    pub bytes_per_packet: u32,
+    pub frames_per_packet: u32,
+    pub bytes_per_frame: u32,
+    pub channels_per_frame: u32,
+    pub bits_per_channel: u32,
+    pub reserved: u32,
+}
+
+pub type IoProcId = *mut c_void;
+
+/// The real-time callback a device calls to hand over input.
+pub type DeviceIoProc = extern "C" fn(
+    AudioObjectId,
+    *const AudioTimeStamp,
+    *const AudioBufferList,
+    *const AudioTimeStamp,
+    *mut AudioBufferList,
+    *const AudioTimeStamp,
+    *mut c_void,
+) -> OsStatus;
+
 #[link(name = "CoreAudio", kind = "framework")]
 extern "C" {
     fn AudioObjectGetPropertyDataSize(
@@ -106,6 +164,101 @@ extern "C" {
         listener: ListenerProc,
         client_data: *mut c_void,
     ) -> OsStatus;
+
+    /// macOS 14.2+. Takes an Objective-C `CATapDescription*`; see `bridge`.
+    fn AudioHardwareCreateProcessTap(
+        description: *mut c_void,
+        out_tap: *mut AudioObjectId,
+    ) -> OsStatus;
+    fn AudioHardwareDestroyProcessTap(tap: AudioObjectId) -> OsStatus;
+
+    fn AudioHardwareCreateAggregateDevice(
+        description: *const c_void,
+        out_device: *mut AudioObjectId,
+    ) -> OsStatus;
+    fn AudioHardwareDestroyAggregateDevice(device: AudioObjectId) -> OsStatus;
+
+    fn AudioDeviceCreateIOProcID(
+        device: AudioObjectId,
+        proc_: DeviceIoProc,
+        client_data: *mut c_void,
+        out_id: *mut IoProcId,
+    ) -> OsStatus;
+    fn AudioDeviceDestroyIOProcID(device: AudioObjectId, id: IoProcId) -> OsStatus;
+    fn AudioDeviceStart(device: AudioObjectId, id: IoProcId) -> OsStatus;
+    fn AudioDeviceStop(device: AudioObjectId, id: IoProcId) -> OsStatus;
+}
+
+/// Create a process tap from an Objective-C `CATapDescription`.
+///
+/// # Safety
+/// `description` must be a live `CATapDescription*`.
+pub unsafe fn create_process_tap(description: *mut c_void) -> Result<AudioObjectId, OsStatus> {
+    let mut tap = OBJECT_UNKNOWN;
+    let status = AudioHardwareCreateProcessTap(description, &mut tap);
+    if status == 0 && tap != OBJECT_UNKNOWN {
+        Ok(tap)
+    } else {
+        Err(status)
+    }
+}
+
+pub fn destroy_process_tap(tap: AudioObjectId) -> OsStatus {
+    // SAFETY: destroying a tap id we created, or a stale one, which the HAL
+    // rejects with a status rather than misbehaving.
+    unsafe { AudioHardwareDestroyProcessTap(tap) }
+}
+
+/// Create an aggregate device from a CoreFoundation description dictionary.
+///
+/// # Safety
+/// `description` must be a live `CFDictionaryRef` of the documented shape.
+pub unsafe fn create_aggregate_device(
+    description: *const c_void,
+) -> Result<AudioObjectId, OsStatus> {
+    let mut device = OBJECT_UNKNOWN;
+    let status = AudioHardwareCreateAggregateDevice(description, &mut device);
+    if status == 0 && device != OBJECT_UNKNOWN {
+        Ok(device)
+    } else {
+        Err(status)
+    }
+}
+
+pub fn destroy_aggregate_device(device: AudioObjectId) -> OsStatus {
+    // SAFETY: as `destroy_process_tap`.
+    unsafe { AudioHardwareDestroyAggregateDevice(device) }
+}
+
+pub fn create_io_proc(
+    device: AudioObjectId,
+    callback: DeviceIoProc,
+) -> Result<IoProcId, OsStatus> {
+    let mut id: IoProcId = std::ptr::null_mut();
+    // SAFETY: `callback` is an `extern "C" fn` with the documented signature.
+    let status = unsafe {
+        AudioDeviceCreateIOProcID(device, callback, std::ptr::null_mut(), &mut id)
+    };
+    if status == 0 && !id.is_null() {
+        Ok(id)
+    } else {
+        Err(status)
+    }
+}
+
+pub fn destroy_io_proc(device: AudioObjectId, id: IoProcId) -> OsStatus {
+    // SAFETY: `id` came from `create_io_proc` for this device.
+    unsafe { AudioDeviceDestroyIOProcID(device, id) }
+}
+
+pub fn device_start(device: AudioObjectId, id: IoProcId) -> OsStatus {
+    // SAFETY: as `destroy_io_proc`.
+    unsafe { AudioDeviceStart(device, id) }
+}
+
+pub fn device_stop(device: AudioObjectId, id: IoProcId) -> OsStatus {
+    // SAFETY: as `destroy_io_proc`.
+    unsafe { AudioDeviceStop(device, id) }
 }
 
 pub type CfTypeRef = *const c_void;
