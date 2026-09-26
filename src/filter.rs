@@ -14,6 +14,11 @@ pub enum Field {
     Path,
     /// Just the file name at the end of that path — the easy one to type.
     Exe,
+    /// **Any ancestor** of the process, by path or by file name. This is what
+    /// lets "anything my own agent sessions spawn" be excused without
+    /// allow-listing `afplay` globally — which would have hidden the very noise
+    /// this tool was built to catch (Chris, 2026-09-26).
+    Ancestor,
 }
 
 impl Field {
@@ -22,11 +27,12 @@ impl Field {
             Field::Bundle => "allow-bundle",
             Field::Path => "allow-path",
             Field::Exe => "allow-exe",
+            Field::Ancestor => "allow-ancestor",
         }
     }
 
     pub fn from_keyword(s: &str) -> Option<Self> {
-        [Field::Bundle, Field::Path, Field::Exe]
+        [Field::Bundle, Field::Path, Field::Exe, Field::Ancestor]
             .into_iter()
             .find(|f| f.keyword() == s)
     }
@@ -36,18 +42,27 @@ impl Field {
             Field::Bundle => "bundle",
             Field::Path => "path",
             Field::Exe => "exe",
+            Field::Ancestor => "ancestor",
         }
     }
 
-    /// The text this rule tests, pulled out of a record.
-    fn value_of(self, record: &Record) -> Option<String> {
+    /// The texts this rule tests, pulled out of a record. All but
+    /// [`Field::Ancestor`] yield at most one; an ancestor rule matches if **any**
+    /// link in the chain matches, by full path or by file name.
+    fn values_of(self, record: &Record) -> Vec<String> {
+        fn basename(p: &str) -> String {
+            p.rsplit('/').next().unwrap_or(p).to_string()
+        }
         match self {
-            Field::Bundle => record.bundle.clone(),
-            Field::Path => record.exe.clone(),
-            Field::Exe => record
-                .exe
-                .as_deref()
-                .map(|p| p.rsplit('/').next().unwrap_or(p).to_string()),
+            Field::Bundle => record.bundle.clone().into_iter().collect(),
+            Field::Path => record.exe.clone().into_iter().collect(),
+            Field::Exe => record.exe.as_deref().map(basename).into_iter().collect(),
+            Field::Ancestor => record
+                .parents
+                .iter()
+                .filter_map(|a| a.exe.clone())
+                .flat_map(|exe| [basename(&exe), exe])
+                .collect(),
         }
     }
 }
@@ -73,8 +88,9 @@ impl Rule {
 
     fn matches(&self, record: &Record) -> bool {
         self.field
-            .value_of(record)
-            .is_some_and(|value| glob_match(&self.pattern, &value))
+            .values_of(record)
+            .iter()
+            .any(|value| glob_match(&self.pattern, value))
     }
 }
 
@@ -244,5 +260,60 @@ mod tests {
             assert_eq!(Field::from_keyword(f.keyword()), Some(f));
         }
         assert_eq!(Field::from_keyword("allow-everything"), None);
+    }
+
+    /// The rule that answers today's case: excuse everything an agent session
+    /// spawns, without excusing `afplay` for the whole machine.
+    #[test]
+    fn an_ancestor_rule_matches_a_parent_by_name_or_by_path() {
+        let mut r = Record::new(0, Kind::OutputStart, 87533);
+        r.exe = Some("/usr/bin/afplay".into());
+        r.parents = vec![
+            crate::proc::Ancestor {
+                pid: 87535,
+                exe: Some("/bin/zsh".into()),
+            },
+            crate::proc::Ancestor {
+                pid: 80740,
+                exe: Some("/opt/homebrew/bin/claude".into()),
+            },
+        ];
+
+        let mut list = AllowList::default();
+        list.push(Rule::new(Field::Ancestor, "claude"));
+        assert!(
+            list.allows(&r).is_some(),
+            "the grandparent's name is enough"
+        );
+
+        let mut by_path = AllowList::default();
+        by_path.push(Rule::new(Field::Ancestor, "/opt/homebrew/*"));
+        assert!(by_path.allows(&r).is_some(), "so is its path");
+
+        // And it is the ancestry that matched, not the process: the same rule
+        // says nothing about an afplay someone else started.
+        let mut orphan = Record::new(0, Kind::OutputStart, 90001);
+        orphan.exe = Some("/usr/bin/afplay".into());
+        assert!(list.allows(&orphan).is_none(), "no chain, no excuse");
+    }
+
+    /// An ancestor whose path could not be read excuses nothing — a pid is not
+    /// an identity to trust a rule against.
+    #[test]
+    fn an_unreadable_ancestor_matches_no_rule() {
+        let mut r = Record::new(0, Kind::OutputStart, 500);
+        r.parents = vec![crate::proc::Ancestor {
+            pid: 400,
+            exe: None,
+        }];
+        let mut list = AllowList::default();
+        list.push(Rule::new(Field::Ancestor, "*"));
+        assert!(list.allows(&r).is_none());
+    }
+
+    #[test]
+    fn allow_ancestor_is_a_config_keyword() {
+        assert_eq!(Field::from_keyword("allow-ancestor"), Some(Field::Ancestor));
+        assert_eq!(Field::Ancestor.keyword(), "allow-ancestor");
     }
 }

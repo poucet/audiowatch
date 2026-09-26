@@ -188,3 +188,34 @@ No dependencies. `cargo test` covers the encoding, the filter rules, the log
 reader, the CLI, the time parsing and the whole state machine including the
 short-lived-process case; the CoreAudio callbacks are covered by hand, as
 described above.
+
+## The process tree
+
+`afplay` on its own is meaningless — half the machine plays a sound that way.
+`afplay ← zsh ← claude` is the whole answer. So every record carries the chain
+above the process, and it is walked **when the process connects to the HAL**,
+not when its output is noticed: a process connects 113–321 ms before it makes a
+sound, and by the time a 200 ms burst is seen its parents can be gone too.
+
+```
+12:10:39  output-start  afplay   pid 87533  ← zsh ← claude  dev[Speakers]
+```
+
+Nearest ancestor first, stopping at `launchd`, depth-capped at 12 with a cycle
+guard. The short form shows three; the log line carries the whole chain with
+every path, and `--now` prints all of it.
+
+### `allow-ancestor`
+
+The filter can match **any ancestor**, by file name or by path:
+
+```conf
+allow-ancestor claude          # anything my agent sessions spawn
+allow-ancestor /opt/homebrew/* # or by where it lives
+```
+
+This is the rule that makes the difference between a useful watcher and a
+useless one. `afplay` is how everything plays a sound, so excusing `afplay`
+would hide everything — including the noise you built this to find. Excusing
+*what started it* does not. An ancestor whose path could not be read matches no
+rule: a bare pid is not an identity to trust a rule against.

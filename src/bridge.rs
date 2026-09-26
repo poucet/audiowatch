@@ -1,3 +1,10 @@
+//! **Unfinished.** The Objective-C bridge the process tap needs
+//! (`CATapDescription` is an ObjC class with no C entry point). Merged onto
+//! main at Chris's request while the tap itself is still being built, so
+//! nothing here is wired up yet and all of it is dead — which is what the
+//! module-level allow says, rather than silencing anything that is finished.
+#![allow(dead_code)]
+
 //! The minimum Objective-C and CoreFoundation needed to build a
 //! `CATapDescription` and an aggregate-device description.
 //!
@@ -102,9 +109,13 @@ pub fn ns_array(objects: &[Id]) -> Option<Id> {
     // SAFETY: NSArray responds to +arrayWithObjects:count: with this signature,
     // and `objects` is valid for `objects.len()` elements.
     unsafe {
-        let f: extern "C" fn(Id, Sel, *const Id, usize) -> Id =
-            std::mem::transmute(msg_send_ptr());
-        let a = f(cls, sel("arrayWithObjects:count:"), objects.as_ptr(), objects.len());
+        let f: extern "C" fn(Id, Sel, *const Id, usize) -> Id = std::mem::transmute(msg_send_ptr());
+        let a = f(
+            cls,
+            sel("arrayWithObjects:count:"),
+            objects.as_ptr(),
+            objects.len(),
+        );
         if a.is_null() {
             None
         } else {
@@ -143,12 +154,7 @@ extern "C" {
         cstr: *const c_char,
         encoding: u32,
     ) -> CfStringRef;
-    fn CFStringGetCString(
-        s: CfStringRef,
-        buffer: *mut c_char,
-        size: isize,
-        encoding: u32,
-    ) -> u8;
+    fn CFStringGetCString(s: CfStringRef, buffer: *mut c_char, size: isize, encoding: u32) -> u8;
     fn CFNumberCreate(alloc: CfAllocatorRef, kind: isize, value: *const c_void) -> CfNumberRef;
     fn CFArrayCreate(
         alloc: CfAllocatorRef,
@@ -218,12 +224,21 @@ pub fn cf_string_to_rust(s: CfStringRef) -> Option<String> {
     let mut buf = vec![0 as c_char; 1024];
     // SAFETY: `buf` is writable for its length; the function NUL-terminates.
     let ok = unsafe {
-        CFStringGetCString(s, buf.as_mut_ptr(), buf.len() as isize, KCF_STRING_ENCODING_UTF8)
+        CFStringGetCString(
+            s,
+            buf.as_mut_ptr(),
+            buf.len() as isize,
+            KCF_STRING_ENCODING_UTF8,
+        )
     };
     if ok == 0 {
         return None;
     }
-    let bytes: Vec<u8> = buf.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
+    let bytes: Vec<u8> = buf
+        .iter()
+        .take_while(|c| **c != 0)
+        .map(|c| *c as u8)
+        .collect();
     String::from_utf8(bytes).ok()
 }
 
@@ -323,6 +338,9 @@ mod tests {
             (k_private.get(), private.get()),
             (k_taps.get(), taps.get()),
         ]);
-        assert!(d.is_some(), "the aggregate description dictionary should build");
+        assert!(
+            d.is_some(),
+            "the aggregate description dictionary should build"
+        );
     }
 }

@@ -50,7 +50,9 @@ pub const PROP_PROCESS_IS_RUNNING_OUTPUT: Selector = fourcc(b"piro");
 
 // Devices.
 pub const PROP_DEVICE_IS_RUNNING_SOMEWHERE: Selector = fourcc(b"gone");
+#[allow(dead_code)] // the process tap is unfinished; see bridge.rs
 pub const PROP_TAP_UID: Selector = fourcc(b"tuid");
+#[allow(dead_code)] // the process tap is unfinished; see bridge.rs
 pub const PROP_TAP_FORMAT: Selector = fourcc(b"tfmt");
 pub const PROP_DEVICE_UID: Selector = fourcc(b"uid ");
 pub const PROP_STREAM_CONFIGURATION: Selector = fourcc(b"slay");
@@ -85,6 +87,7 @@ pub type ListenerProc =
 
 /// `AudioBuffer` — one buffer of interleaved samples.
 #[repr(C)]
+#[allow(dead_code)] // the process tap is unfinished; see bridge.rs
 pub struct AudioBuffer {
     pub number_channels: u32,
     pub data_byte_size: u32,
@@ -93,6 +96,7 @@ pub struct AudioBuffer {
 
 /// `AudioBufferList` — a count followed by that many `AudioBuffer`s inline.
 #[repr(C)]
+#[allow(dead_code)] // the process tap is unfinished; see bridge.rs
 pub struct AudioBufferList {
     pub number_buffers: u32,
     pub buffers: [AudioBuffer; 1],
@@ -101,6 +105,7 @@ pub struct AudioBufferList {
 /// `AudioTimeStamp`. Only its size and layout matter here; the IOProc never
 /// reads it, but it must be the right size for the ABI.
 #[repr(C)]
+#[allow(dead_code)] // the process tap is unfinished; see bridge.rs
 pub struct AudioTimeStamp {
     pub sample_time: f64,
     pub host_time: u64,
@@ -114,6 +119,7 @@ pub struct AudioTimeStamp {
 /// `AudioStreamBasicDescription`, as returned by `kAudioTapPropertyFormat`.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
+#[allow(dead_code)] // the process tap is unfinished; see bridge.rs
 pub struct StreamBasicDescription {
     pub sample_rate: f64,
     pub format_id: u32,
@@ -126,9 +132,11 @@ pub struct StreamBasicDescription {
     pub reserved: u32,
 }
 
+#[allow(dead_code)] // the process tap is unfinished; see bridge.rs
 pub type IoProcId = *mut c_void;
 
 /// The real-time callback a device calls to hand over input.
+#[allow(dead_code)] // the process tap is unfinished; see bridge.rs
 pub type DeviceIoProc = extern "C" fn(
     AudioObjectId,
     *const AudioTimeStamp,
@@ -193,6 +201,7 @@ extern "C" {
 ///
 /// # Safety
 /// `description` must be a live `CATapDescription*`.
+#[allow(dead_code)] // the process tap is unfinished; see bridge.rs
 pub unsafe fn create_process_tap(description: *mut c_void) -> Result<AudioObjectId, OsStatus> {
     let mut tap = OBJECT_UNKNOWN;
     let status = AudioHardwareCreateProcessTap(description, &mut tap);
@@ -203,6 +212,7 @@ pub unsafe fn create_process_tap(description: *mut c_void) -> Result<AudioObject
     }
 }
 
+#[allow(dead_code)] // the process tap is unfinished; see bridge.rs
 pub fn destroy_process_tap(tap: AudioObjectId) -> OsStatus {
     // SAFETY: destroying a tap id we created, or a stale one, which the HAL
     // rejects with a status rather than misbehaving.
@@ -213,6 +223,7 @@ pub fn destroy_process_tap(tap: AudioObjectId) -> OsStatus {
 ///
 /// # Safety
 /// `description` must be a live `CFDictionaryRef` of the documented shape.
+#[allow(dead_code)] // the process tap is unfinished; see bridge.rs
 pub unsafe fn create_aggregate_device(
     description: *const c_void,
 ) -> Result<AudioObjectId, OsStatus> {
@@ -225,20 +236,18 @@ pub unsafe fn create_aggregate_device(
     }
 }
 
+#[allow(dead_code)] // the process tap is unfinished; see bridge.rs
 pub fn destroy_aggregate_device(device: AudioObjectId) -> OsStatus {
     // SAFETY: as `destroy_process_tap`.
     unsafe { AudioHardwareDestroyAggregateDevice(device) }
 }
 
-pub fn create_io_proc(
-    device: AudioObjectId,
-    callback: DeviceIoProc,
-) -> Result<IoProcId, OsStatus> {
+#[allow(dead_code)] // the process tap is unfinished; see bridge.rs
+pub fn create_io_proc(device: AudioObjectId, callback: DeviceIoProc) -> Result<IoProcId, OsStatus> {
     let mut id: IoProcId = std::ptr::null_mut();
     // SAFETY: `callback` is an `extern "C" fn` with the documented signature.
-    let status = unsafe {
-        AudioDeviceCreateIOProcID(device, callback, std::ptr::null_mut(), &mut id)
-    };
+    let status =
+        unsafe { AudioDeviceCreateIOProcID(device, callback, std::ptr::null_mut(), &mut id) };
     if status == 0 && !id.is_null() {
         Ok(id)
     } else {
@@ -246,16 +255,19 @@ pub fn create_io_proc(
     }
 }
 
+#[allow(dead_code)] // the process tap is unfinished; see bridge.rs
 pub fn destroy_io_proc(device: AudioObjectId, id: IoProcId) -> OsStatus {
     // SAFETY: `id` came from `create_io_proc` for this device.
     unsafe { AudioDeviceDestroyIOProcID(device, id) }
 }
 
+#[allow(dead_code)] // the process tap is unfinished; see bridge.rs
 pub fn device_start(device: AudioObjectId, id: IoProcId) -> OsStatus {
     // SAFETY: as `destroy_io_proc`.
     unsafe { AudioDeviceStart(device, id) }
 }
 
+#[allow(dead_code)] // the process tap is unfinished; see bridge.rs
 pub fn device_stop(device: AudioObjectId, id: IoProcId) -> OsStatus {
     // SAFETY: as `destroy_io_proc`.
     unsafe { AudioDeviceStop(device, id) }
@@ -515,5 +527,114 @@ mod tests {
         );
         assert_eq!(pid_path(0), None);
         assert_eq!(pid_path(-1), None);
+    }
+}
+
+// ── the process tree ────────────────────────────────────────────────────────
+//
+// `afplay` on its own says nothing; `afplay ← zsh ← claude` is the whole
+// answer (Chris, 2026-09-26: *"I can't tell who's triggering the afplay"*).
+// The parent is `pbi_ppid` out of `PROC_PIDTBSDINFO`, and the kernel refuses
+// the call unless `buffersize` is exactly `sizeof(struct proc_bsdinfo)` — so
+// the struct below is field for field out of `sys/proc_info.h`, and the size
+// is asserted at compile time. Get the layout wrong and the build stops,
+// rather than the feature going quietly blind.
+
+/// `PROC_PIDTBSDINFO` (`sys/proc_info.h`).
+const PROC_PIDTBSDINFO: c_int = 3;
+
+/// `MAXCOMLEN` (`sys/param.h`).
+const MAXCOMLEN: usize = 16;
+
+/// `struct proc_bsdinfo`, exactly as `sys/proc_info.h` lays it out.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcBsdInfo {
+    pbi_flags: u32,
+    pbi_status: u32,
+    pbi_xstatus: u32,
+    pbi_pid: u32,
+    pbi_ppid: u32,
+    pbi_uid: u32,
+    pbi_gid: u32,
+    pbi_ruid: u32,
+    pbi_rgid: u32,
+    pbi_svuid: u32,
+    pbi_svgid: u32,
+    rfu_1: u32,
+    pbi_comm: [u8; MAXCOMLEN],
+    pbi_name: [u8; 2 * MAXCOMLEN],
+    pbi_nfiles: u32,
+    pbi_pgid: u32,
+    pbi_pjobc: u32,
+    e_tdev: u32,
+    e_tpgid: u32,
+    pbi_nice: i32,
+    pbi_start_tvsec: u64,
+    pbi_start_tvusec: u64,
+}
+
+// 12 u32s, then 16 + 32 bytes of names, then 5 u32s and an i32, then two u64s:
+// 48 + 48 + 24 + 16 = 136. The kernel checks this number, so we check it too.
+const _: () = assert!(core::mem::size_of::<ProcBsdInfo>() == 136);
+
+extern "C" {
+    fn proc_pidinfo(
+        pid: c_int,
+        flavor: c_int,
+        arg: u64,
+        buffer: *mut c_void,
+        buffersize: c_int,
+    ) -> c_int;
+}
+
+/// The parent of a running process, or `None` if it has exited, is not
+/// readable by this user, or is `launchd` itself.
+pub fn pid_ppid(pid: i32) -> Option<i32> {
+    if pid <= 1 {
+        return None;
+    }
+    let mut info = ProcBsdInfo {
+        pbi_flags: 0,
+        pbi_status: 0,
+        pbi_xstatus: 0,
+        pbi_pid: 0,
+        pbi_ppid: 0,
+        pbi_uid: 0,
+        pbi_gid: 0,
+        pbi_ruid: 0,
+        pbi_rgid: 0,
+        pbi_svuid: 0,
+        pbi_svgid: 0,
+        rfu_1: 0,
+        pbi_comm: [0; MAXCOMLEN],
+        pbi_name: [0; 2 * MAXCOMLEN],
+        pbi_nfiles: 0,
+        pbi_pgid: 0,
+        pbi_pjobc: 0,
+        e_tdev: 0,
+        e_tpgid: 0,
+        pbi_nice: 0,
+        pbi_start_tvsec: 0,
+        pbi_start_tvusec: 0,
+    };
+    let size = core::mem::size_of::<ProcBsdInfo>() as c_int;
+    // SAFETY: `info` is writable for exactly `size` bytes, which is the size
+    // this flavour requires.
+    let n = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut ProcBsdInfo).cast(),
+            size,
+        )
+    };
+    if n != size {
+        return None;
+    }
+    match info.pbi_ppid {
+        0 => None,
+        p => Some(p as i32),
     }
 }
