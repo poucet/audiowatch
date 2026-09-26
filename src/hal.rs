@@ -3,6 +3,7 @@
 //! Everything the state machine needs about the world arrives through
 //! [`HalView`], so the machine itself can be tested against a fake.
 
+use crate::proc::{self, Ancestor};
 use crate::sys::{self, AudioObjectId, PropertyAddress};
 use std::collections::HashMap;
 
@@ -27,6 +28,9 @@ pub struct ProcessDetails {
     pub exe: Option<String>,
     /// Names of the output devices the process is running on.
     pub devices: Vec<String>,
+    /// The process tree above this one, nearest first. Walked here, at the same
+    /// moment as `exe`, because both are gone once the process exits.
+    pub parents: Vec<Ancestor>,
 }
 
 /// The source of truth about audio processes. Implemented for real by
@@ -160,6 +164,7 @@ impl HalView for CoreAudio {
             ),
             exe: sys::pid_path(pid),
             devices,
+            parents: proc::live_chain(pid),
         })
     }
 }

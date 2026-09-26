@@ -11,6 +11,7 @@ mod filter;
 mod hal;
 mod logfile;
 mod notify;
+mod proc;
 mod reconcile;
 mod sys;
 mod timefmt;

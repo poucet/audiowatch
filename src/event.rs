@@ -4,6 +4,7 @@
 //! it stays greppable and `awk`-able while round-tripping exactly. The encoder
 //! and the decoder below are the only two places that know the column order.
 
+use crate::proc::{self, Ancestor};
 use crate::timefmt;
 
 /// What the HAL told us happened.
@@ -98,6 +99,10 @@ pub struct Record {
     /// Anything the watcher wants to remember, e.g. that the process had
     /// already exited by the time its output was noticed.
     pub note: Option<String>,
+    /// The process tree above this one, nearest first, captured when the
+    /// process connected to the HAL. `afplay` alone says nothing; `afplay ←
+    /// zsh ← claude` is the answer (Chris, 2026-09-26).
+    pub parents: Vec<Ancestor>,
 }
 
 impl Record {
@@ -111,6 +116,7 @@ impl Record {
             exe: None,
             devices: Vec::new(),
             note: None,
+            parents: Vec::new(),
         }
     }
 
@@ -141,6 +147,7 @@ impl Record {
             self.exe.clone().unwrap_or_default(),
             self.devices.join(", "),
             self.note.clone().unwrap_or_default(),
+            encode_parents(&self.parents),
         ];
         cols.iter()
             .map(|c| escape(c))
@@ -167,6 +174,9 @@ impl Record {
             exe: some_if_set(&cols[6]),
             devices,
             note: some_if_set(&cols[8]),
+            // A tenth column, so every line written before the process tree
+            // existed still decodes.
+            parents: cols.get(9).map(|c| decode_parents(c)).unwrap_or_default(),
         })
     }
 
@@ -179,6 +189,9 @@ impl Record {
             self.short_name(),
             self.pid
         );
+        if !self.parents.is_empty() {
+            s.push_str(&format!(" ← {}", proc::render(&self.parents, CHAIN_SHOWN)));
+        }
         if !self.devices.is_empty() {
             s.push_str(&format!(" dev[{}]", self.devices.join(", ")));
         }
@@ -195,6 +208,42 @@ impl Record {
         }
         s
     }
+}
+
+/// How many ancestors the one-line form shows. Enough for `zsh ← claude`, the
+/// case that mattered, without turning the line into a stack trace; the whole
+/// chain is in the log and behind `--verbose`.
+pub const CHAIN_SHOWN: usize = 3;
+
+/// `pid path` per ancestor, joined the way devices are. A path cannot contain
+/// `", "` and a pid cannot contain a space, so this round-trips.
+fn encode_parents(parents: &[Ancestor]) -> String {
+    parents
+        .iter()
+        .map(|a| match &a.exe {
+            Some(exe) => format!("{} {exe}", a.pid),
+            None => a.pid.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn decode_parents(col: &str) -> Vec<Ancestor> {
+    if col.is_empty() {
+        return Vec::new();
+    }
+    col.split(", ")
+        .filter_map(|entry| match entry.split_once(' ') {
+            Some((pid, exe)) => Some(Ancestor {
+                pid: pid.parse().ok()?,
+                exe: Some(exe.to_string()),
+            }),
+            None => Some(Ancestor {
+                pid: entry.parse().ok()?,
+                exe: None,
+            }),
+        })
+        .collect()
 }
 
 fn some_if_set(s: &str) -> Option<String> {
@@ -255,6 +304,16 @@ mod tests {
             bundle: Some("com.example.thing".into()),
             exe: Some("/usr/bin/afplay".into()),
             devices: vec!["Scarlett 4i4 USB".into(), "BlackHole 2ch".into()],
+            parents: vec![
+                Ancestor {
+                    pid: 80740,
+                    exe: Some("/opt/homebrew/bin/claude".into()),
+                },
+                Ancestor {
+                    pid: 1,
+                    exe: Some("/sbin/launchd".into()),
+                },
+            ],
             note: None,
         }
     }
@@ -285,8 +344,51 @@ mod tests {
     }
 
     #[test]
-    fn the_line_has_exactly_the_nine_columns() {
-        assert_eq!(sample().encode().split('\t').count(), 9);
+    fn the_line_has_exactly_the_ten_columns() {
+        assert_eq!(sample().encode().split('\t').count(), 10);
+    }
+
+    /// The process tree is a **tenth** column, so every line written before it
+    /// existed still decodes — with an empty chain rather than a parse failure.
+    #[test]
+    fn a_line_written_before_the_process_tree_still_decodes() {
+        let full = sample();
+        let old: String = full
+            .encode()
+            .split('\t')
+            .take(9)
+            .collect::<Vec<_>>()
+            .join("\t");
+        let back = Record::decode(&old).expect("nine columns still decode");
+        assert!(back.parents.is_empty());
+        assert_eq!(back.exe, full.exe);
+        assert_eq!(back.devices, full.devices);
+    }
+
+    /// The chain round-trips, including an ancestor whose path could not be read.
+    #[test]
+    fn the_chain_round_trips_through_the_log() {
+        let mut r = sample();
+        r.parents = vec![
+            Ancestor {
+                pid: 87533,
+                exe: Some("/bin/zsh".into()),
+            },
+            Ancestor {
+                pid: 400,
+                exe: None,
+            },
+            Ancestor {
+                pid: 1,
+                exe: Some("/sbin/launchd".into()),
+            },
+        ];
+        assert_eq!(Record::decode(&r.encode()), Some(r.clone()));
+        assert!(
+            r.human().contains("← zsh ← pid 400 ← launchd"),
+            "{}",
+            r.human()
+        );
     }
 
     #[test]
@@ -297,7 +399,7 @@ mod tests {
         let line = r.encode();
         assert_eq!(
             line.split('\t').count(),
-            9,
+            10,
             "escaping leaked a column: {line}"
         );
         assert_eq!(Record::decode(&line), Some(r));

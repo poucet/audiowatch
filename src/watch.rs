@@ -292,6 +292,13 @@ pub fn print_now(hal: &CoreAudio) {
                 .or(details.bundle)
                 .unwrap_or_else(|| format!("<pid {} is gone>", details.pid))
         );
+        if !details.parents.is_empty() {
+            println!(
+                "{:>13}from {}",
+                "",
+                crate::proc::render(&details.parents, crate::proc::MAX_DEPTH)
+            );
+        }
         if !details.devices.is_empty() {
             println!("{:>13}on {}", "", details.devices.join(", "));
         }

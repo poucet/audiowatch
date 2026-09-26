@@ -6,6 +6,7 @@
 
 use crate::event::{Kind, Record};
 use crate::hal::HalView;
+use crate::proc::Ancestor;
 use crate::sys::AudioObjectId;
 use std::collections::HashMap;
 
@@ -36,6 +37,9 @@ struct Tracked {
     /// Last known non-empty output device list, so a stop event can still say
     /// which device fell silent.
     devices: Vec<String>,
+    /// The chain above the process, cached at connect for the same reason `exe`
+    /// is: a 200 ms process's parents can be gone before its output is noticed.
+    parents: Vec<Ancestor>,
 }
 
 #[derive(Default)]
@@ -92,6 +96,9 @@ impl Reconciler {
                 if let Some(details) = hal.details(object) {
                     entry.pid = details.pid;
                     entry.exe = details.exe.clone().or(entry.exe);
+                    if entry.parents.is_empty() {
+                        entry.parents = details.parents.clone();
+                    }
                     entry.bundle = details.bundle.clone().or(entry.bundle);
                     if !details.devices.is_empty() {
                         entry.devices = details.devices;
@@ -112,6 +119,7 @@ impl Reconciler {
                 let mut r = Record::new(now_ms, kind, entry.pid);
                 r.bundle = entry.bundle.clone();
                 r.exe = entry.exe.clone();
+                r.parents = entry.parents.clone();
                 r.devices = entry.devices.clone();
                 r.note = note_for(kind, &note);
                 records.push(r);
@@ -169,6 +177,7 @@ impl Reconciler {
                 let mut r = Record::new(now_ms, kind, entry.pid);
                 r.bundle = entry.bundle.clone();
                 r.exe = entry.exe.clone();
+                r.parents = entry.parents.clone();
                 r.devices = entry.devices.clone();
                 records.push(r);
             };
@@ -233,6 +242,10 @@ mod tests {
                 pid,
                 bundle: None,
                 exe: exe.map(str::to_string),
+                parents: vec![Ancestor {
+                    pid: 1,
+                    exe: Some("/sbin/launchd".into()),
+                }],
                 devices: if out {
                     vec!["Scarlett 4i4 USB".into()]
                 } else {
