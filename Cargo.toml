@@ -1,0 +1,19 @@
+[package]
+name = "audiowatch"
+version = "0.1.0"
+edition = "2021"
+description = "Watches which processes put audio on this Mac's CoreAudio output devices, and says so."
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "audiowatch"
+path = "src/main.rs"
+
+[dependencies]
+# Intentionally none. Everything this tool needs is CoreAudio, libproc and libc,
+# all reached through the hand-written declarations in src/sys.rs.
+
+[profile.release]
+opt-level = 2
+strip = true
