@@ -219,3 +219,23 @@ useless one. `afplay` is how everything plays a sound, so excusing `afplay`
 would hide everything — including the noise you built this to find. Excusing
 *what started it* does not. An ancestor whose path could not be read matches no
 rule: a bare pid is not an identity to trust a rule against.
+
+## Status — done (2026-09-26)
+
+Chris: *"audiowatch can be considered done."* The detector, the log, the filter,
+the notifications and the process tree are finished, gated and installed at
+`~/.local/bin/audiowatch`. Nothing is running: the LaunchAgent is written and
+**not loaded**, so it does nothing until you bootstrap it.
+
+```sh
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.audiowatch.plist
+launchctl bootout   gui/$(id -u)/local.audiowatch    # and to stop it
+```
+
+**The process tap was started and is not finished.** `src/tap.rs` and
+`src/bridge.rs` are in the tree, unreferenced, marked `#[allow(dead_code)]` item
+by item. They are the escalation described in *What would still slip past it*:
+they would see audio passing through a **permanently open** stream, which is the
+one failure mode this tool cannot detect, and the shape `arkaudiod` has on this
+machine. Nothing else depends on them; they are kept rather than deleted so that
+route is a resumption rather than a rewrite.
