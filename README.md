@@ -5,6 +5,8 @@ Names the process that just put audio on one of this Mac's outputs.
 * **Short-lived ones too**: a process that starts, plays and exits in a fraction of a second.
 * **Silent itself**: it never plays anything.
 
+It also **records**: any channel, or pair of channels, of any audio device to a WAV file, for an agent over MCP or from the command line. See [Recording](#recording).
+
 ## Run it
 
 ```sh
@@ -39,6 +41,8 @@ audiowatch --now             # what is making sound at this instant
 audiowatch --devices         # devices and their channel counts
 audiowatch --test-notify     # post a notification and verify it arrived
 audiowatch --paths           # where the config and log are
+audiowatch --mcp             # serve the recorder over MCP (see Recording)
+audiowatch rec list          # devices, and what can be recorded from each
 ```
 
 ## Where things live
@@ -208,11 +212,20 @@ flowchart LR
 | `src/logfile.rs` | append-only writer, reader and `--since` / `--tail` |
 | `src/notify.rs` | notifications, and checking they arrived |
 | `src/agent.rs` | the LaunchAgent plist |
+| `src/rec/` | the recorder's MCP server (`audiowatch --mcp`) and its command line (`audiowatch rec`) |
+| `crates/audiowatch-record` | the recorder: take specs, which device records in which direction, the writer thread, sessions and the host-time window |
+| `crates/audiowatch-clock` | recording in time with a MIDI clock: the downbeats, the tempo, the MIDI input (feature `midi-clock`) |
+| `crates/simply-*` | device enumeration, MIDI clock messages, and the trait the MCP tools are derived from |
 
-* **No dependencies.**
-* `cargo test` covers the encoding, the filter rules, the log reader, the CLI and the time parsing.
+* **The watcher has no dependencies.**
+  * It reaches CoreAudio, libproc and libc through the declarations in `src/sys.rs`.
+  * Its modules use none of the crates in `Cargo.toml`.
+* **The recorder has some**: `cpal` for devices, `hound` and `rtrb` to write, `midir` for the clock, `rmcp`, `axum` and `tokio` to serve.
+* `cargo test --workspace` covers the encoding, the filter rules, the log reader, the CLI and the time parsing.
   * Also the whole state machine, including the short-lived-process case.
+  * Also the recorder: take specs, routing, the trim to a window, the clock timeline, and the MCP surface over a real socket.
 * The CoreAudio callbacks are covered by hand, as described above.
+* Two tests open a real device and are ignored in the gate; see [Recording](#recording).
 
 ## The process tree
 
@@ -275,3 +288,169 @@ launchctl bootout   gui/$(id -u)/local.audiowatch    # and to stop it
   * The shape `arkaudiod` has on this machine.
 * Nothing else depends on them.
 * Kept rather than deleted, so that route is a resumption, not a rewrite.
+
+## Recording
+
+`audiowatch` records channels of this Mac's audio devices to 32-bit float WAV.
+
+* **For an agent first.** Non-interactive, and every recording has a length fixed at the start.
+* **Paths, never audio.** An answer names each file by absolute path. It never carries the audio.
+* **Never plays anything.** It opens no output stream and sends nothing to any MIDI port.
+
+### Reach it
+
+| surface | how | use when |
+|---|---|---|
+| MCP | `audiowatch --mcp [--port 3929] [--dir DIR]`, endpoint `http://127.0.0.1:3929/mcp` | the normal case |
+| shell | `audiowatch rec list --json`, `audiowatch rec clocks`, `audiowatch rec record --seconds N --json TAKE...`, `audiowatch rec record --bars N [--beats-per-bar B] [--clock PORT] TAKE...` | no MCP client, or a skill that runs commands |
+
+```sh
+cargo build --release
+./target/release/audiowatch --mcp
+claude mcp add --transport http audiowatch http://127.0.0.1:3929/mcp
+```
+
+* **Files go in `~/Music/audio-rec/`**
+  * unless the server was started with `--dir`, the call passes `dir`, or a take names its own `=PATH.wav`.
+* Generated names say what they hold: `zoom-l6max-in-13-14-<unix-seconds>.wav`.
+
+### The rule: paths, never audio
+
+* An answer names each take's file by **absolute path**.
+  * A text line, and on MCP a `resource_link` with a `file://` URI and `audio/wav`.
+* It never carries the audio: no base64, no audio or embedded-resource blocks. **No levels either.**
+  * Pass the path to whatever measures or plays it.
+* A path is only returned once its file is finished and closed.
+  * One exception, which says so: `wait: false`, below.
+
+### Tools
+
+* **`list_devices`**: call first.
+  * Every device, both sides, channel counts, current rate, the stereo pairs, `record_in` / `record_out`.
+  * A note on every refused direction saying what to do instead.
+* **`record(takes, seconds | bars, beats_per_bar?, clock?, dir?, wait?)`**
+  * Records for a length fixed at the start: `seconds`, or `bars` of a MIDI clock (below).
+  * Waiting (the default) it blocks, at most **50 s**, and returns finished files.
+  * There is no stop verb and no open-ended recording.
+* **`await_recording(id)`**: collects a `wait: false` recording; see below.
+
+### Takes
+
+A take is `DEVICE:in|out:CHANNELS[=PATH.wav]`.
+
+* **`DEVICE`**: the exact name from `list_devices`, or an unambiguous fragment of it.
+* **`in`**: what arrives at the device. A mixer's or interface's inputs, a microphone, a virtual device's return.
+* **`out`**: what the computer sends to the device.
+  * Only devices with **no input side** (built-in speakers, displays) can be tapped, on macOS 14.2+.
+* **`CHANNELS`**: one channel (`3`, a mono file) or an adjacent pair (`3-4`, stereo), counting from 1.
+* **Takes in one call start together.**
+  * Each is its own stream and its own 32-bit float file, at its device's own rate.
+  * Never resampled, never mixed. Two devices are two clocks, which is why they are two files.
+* **Read `warnings`.** Each names its take:
+  * audio **dropped** (the writer fell behind, the file has gaps: record it again);
+  * no audio arrived;
+  * a stream error.
+
+### Recipe: record while something else plays
+
+An agent is bad at real time, so never "start, then stop when it sounds done".
+
+1. `record(takes: ["BlackHole 16ch:in:1-2"], seconds: 20, wait: false)`
+   * Returns at once with an `id` and the paths the files **will** have.
+   * They are **not readable yet**.
+2. Make the sound: start the synth, the render, the transport.
+3. `await_recording(id)`
+   * Returns once the files are finished, exactly as a waiting `record` would.
+   * It sends progress while it waits. If the client times out anyway, call it again: the result is kept until collected.
+   * At most 8 uncollected recordings are kept. The oldest finished one is dropped to make room; its files stay on disk.
+   * `wait: false` allows up to **600 s**.
+
+### Recipe: record N bars in time with a MIDI clock
+
+When something on the desk sends MIDI clock (a drum machine, a groovebox, a DAW), `record(takes, bars: 4)` lands every take on the clock's **next downbeat** and ends it **4 bars later, counted in clock ticks**. A tempo change mid-take still ends on the bar.
+
+* **Which clock**: the one MIDI input that is sending clock (`0xF8`).
+  * Several: refused, naming them with their tempos. Pass `clock: "<port>"`.
+  * None: refused, naming every input.
+  * A master that sends clock only while playing is silent at arm time: name its port and use `wait: false`.
+  * `audiowatch rec clocks` lists the MIDI inputs and which are ticking.
+* **Where the bar is**: MIDI clock carries ticks, not bars.
+  * The bar is counted from the clock's `Start` (or `Song Position` + `Continue`).
+  * A clock that was **already running** when the take armed has no bar, so the take **waits for the next Start**.
+  * Ask the person to stop and start the master (or arm, then press play).
+  * `beats_per_bar` (default 4) is the one thing the clock cannot say.
+* **The answer** carries, beside the paths:
+  * `clock.tempo_bpm`, the mean over the take from the ticks, with the slowest and fastest beat;
+  * `clock.start_bar`;
+  * `clock.bars`: fewer than asked if the clock stopped, jumped or went silent, and a warning names which;
+  * per take, `sync.trimmed_frames` (pre-roll cut off) and `sync.offset_frames` (the first frame against the exact downbeat, within ±0.5).
+* **Caps**
+  * A waiting call needs the tempo (the clock must be ticking), and the bars plus a bar's wait plus 2 s must fit in 50 s. Otherwise `wait: false`.
+  * With `wait: false` the bars must fit in 600 s, and it waits up to 120 s for the downbeat.
+* **How it lands**
+  * Audio runs from the moment the call arrives, into a `.part.wav` beside the final path.
+  * The downbeat is a least-squares fit through the ticks half a beat either side of it, averaging MIDI's arrival jitter.
+  * It is mapped to a frame through each buffer's capture time. Both are on macOS's host clock.
+  * The file is trimmed to it. macOS only.
+* **It is a build feature**, `midi-clock`, on by default.
+  * `cargo build --release --no-default-features` builds a recorder with no MIDI at all.
+  * That build refuses `bars`, `clocks` and `--bars` by name, and records by seconds.
+
+### What can be recorded on this machine
+
+Measured with `audiowatch rec list`, 2026-09-27.
+
+* **`out` is a CoreAudio tap**, and cpal builds one only for a device with no input side (macOS 14.2+).
+* The rule is in `crates/audiowatch-record/src/catalog.rs` and its tests.
+
+| device | channels in / out | `in` | `out` | lever for 🚫 |
+|---|---|---|---|---|
+| ZOOM L6max (the mixer) | 14 / 4 | ✅ pairs 1-2 … 13-14 | 🚫 | has an input side, so it cannot be tapped: send its bus to BlackHole or Loopback as well and record that `in` |
+| Scarlett 4i4 USB | 6 / 4 | ✅ 1-2, 3-4, 5-6 | 🚫 | same: route through BlackHole or Loopback |
+| BlackHole 16ch | 16 / 16 | ✅ pairs 1-2 … 15-16 | | not needed: what is sent to it comes back on its input, so record it `in` |
+| BlackHole 2ch | 2 / 2 | ✅ 1-2 | | same as BlackHole 16ch |
+| Loopback devices: Stream, Spotify, Chrome, DAWless | 2 / 0 | ✅ 1-2 | | input-only already |
+| Loopback device: Speakers | 2 / 2 | ✅ 1-2 | | record it `in` |
+| MacBook Pro Speakers | 0 / 2 | | ✅ tap | |
+| MacBook Pro Microphone | 1 / 0 | ✅ `1` (mono) | | |
+| Yeti Stereo Microphone | 2 / 0 | ✅ 1-2 | | the Yeti's headphone out is a separate device of the same name, and it can be tapped `out` |
+| LG HDR WQHD+, ARZOPA (displays) | 0 / 2 | | ✅ tap | |
+
+* Rates are each device's own.
+  * The L6max, BlackHole and Scarlett run at 48 kHz.
+  * The Stream and Chrome Loopback devices and the MacBook's own audio run at 44.1 kHz.
+
+### Example takes
+
+* The mixer's main pair (its last two channels) and what the computer is sending to BlackHole, together: `["ZOOM L6max:in:13-14", "BlackHole 16ch:in:1-2"]`
+* One mixer channel as mono: `"ZOOM L6max:in:1"`
+* An app playing into BlackHole 16ch: `"BlackHole 16ch:in:1-2=app.wav"`
+* What the laptop speakers are playing: `"MacBook Pro Speakers:out:1-2"`
+
+### Permissions
+
+The app that runs the recorder (the terminal, or whatever launched `audiowatch --mcp`) needs, in System Settings → Privacy & Security:
+
+* **Microphone**: for any `in` take.
+* **Screen & System Audio Recording** ("System Audio Recording Only"): for an `out` take (a tap).
+* A refusal macOS reports as an error comes back naming the setting.
+* ⚠️ macOS may answer a missing permission with **silence** rather than an error.
+  * Measure a first take on a new route before trusting it.
+
+### Checking it by hand
+
+Two tests open a real device (BlackHole 16ch, input only) and are left out of the gate:
+
+```sh
+cargo test --test rec_http -- --ignored              # wait: false, then await_recording
+cargo test -p audiowatch-record -- --ignored         # a take trimmed to a window of host time
+```
+
+### The recorder and the process tap
+
+* cpal's `out` tap is **one tap per output device, of every process together**.
+  * It records what goes out to a device. It cannot say which process put it there.
+* So it does **not** cover `src/tap.rs` / `src/bridge.rs`.
+  * Those build one tap **per process** in one aggregate, so buffer *i* is process *i*.
+  * That is what would meter audio passing through a permanently open stream, per process.
+* They stay unfinished and unreferenced, as [Not yet constructed](#not-yet-constructed-the-process-tap) says.
