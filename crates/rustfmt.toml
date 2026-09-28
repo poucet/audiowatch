@@ -1,0 +1,11 @@
+# The house style, measured rather than chosen: `use_small_heuristics = "Max"`
+# is the setting that matters. rustfmt's default caps a function call at
+# `fn_call_width = 60` regardless of `max_width`, which is why `cargo fmt
+# --check` disagreed with 2811 hunks of code no lane had touched — the code is
+# written to the line width, not to 60. Raising the sub-widths to `max_width`
+# removes 69% of that disagreement on its own.
+#
+# `max_width = 100` is the minimum of the curve, measured: 96 -> 907 hunks,
+# 100 -> 866, 110 -> 1355, 120 -> 1750.
+max_width = 100
+use_small_heuristics = "Max"

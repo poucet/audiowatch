@@ -2,18 +2,79 @@
 name = "audiowatch"
 version = "0.1.0"
 edition = "2021"
-description = "Watches which processes put audio on this Mac's CoreAudio output devices, and says so."
+description = "Watches which processes put audio on this Mac's CoreAudio output devices, and records any device's channels to WAV for an agent."
 license = "MIT"
 publish = false
+
+[lib]
+path = "src/lib.rs"
 
 [[bin]]
 name = "audiowatch"
 path = "src/main.rs"
 
+[features]
+default = ["midi-clock"]
+# Recording in time with a MIDI clock: `bars` on the MCP `record` tool, and
+# `audiowatch rec clocks` / `record --bars`. Without it the recorder takes
+# seconds only and builds no MIDI input.
+midi-clock = ["dep:audiowatch-clock"]
+
 [dependencies]
-# Intentionally none. Everything this tool needs is CoreAudio, libproc and libc,
-# all reached through the hand-written declarations in src/sys.rs.
+# The watcher (src/main.rs and its modules) uses none of these: it reaches
+# CoreAudio, libproc and libc through the declarations in src/sys.rs. They
+# are the recorder's: `audiowatch --mcp` and `audiowatch rec`.
+audiowatch-record = { workspace = true, features = ["schema"] }
+audiowatch-clock = { workspace = true, features = ["schema"], optional = true }
+simply-api.workspace = true
+async-trait = "0.1"
+axum = "0.8"
+rmcp = { version = "3.1.4", features = ["server", "transport-streamable-http-server"] }
+schemars = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+
+[dev-dependencies]
+rmcp = { version = "3.1.4", features = [
+    "client",
+    "transport-streamable-http-client",
+    "transport-streamable-http-client-reqwest",
+] }
+tokio-util = "0.7"
+hound = "3"
 
 [profile.release]
 opt-level = 2
 strip = true
+
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "crates/audiowatch-record",
+    "crates/audiowatch-clock",
+    "crates/simply-audio-device",
+    "crates/simply-midi-clock",
+    "crates/simply-api",
+    "crates/simply-api-macros",
+    "crates/simply-history",
+    "crates/simply-op-macros",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+audiowatch-record = { path = "crates/audiowatch-record" }
+audiowatch-clock = { path = "crates/audiowatch-clock" }
+simply-audio-device = { path = "crates/simply-audio-device" }
+simply-midi-clock = { path = "crates/simply-midi-clock" }
+simply-api = { path = "crates/simply-api" }
+simply-api-macros = { path = "crates/simply-api-macros" }
+simply-history = { path = "crates/simply-history" }
+simply-op-macros = { path = "crates/simply-op-macros" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

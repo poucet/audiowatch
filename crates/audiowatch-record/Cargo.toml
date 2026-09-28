@@ -1,0 +1,21 @@
+[package]
+name = "audiowatch-record"
+description = "Record any channel pair of any audio device to 32-bit float WAV: for a length, or trimmed to a window of host time"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# JSON schemas for the recording types, for the MCP surface. Off by default
+# so nothing else pays for schemars.
+schema = ["dep:schemars"]
+
+[dependencies]
+simply-audio-device.workspace = true
+cpal = "0.18.2"
+# A lock-free ring between the audio callback and a writer thread, and the
+# WAV it writes.
+hound = "3"
+rtrb = "0.4.0"
+serde = { workspace = true }
+schemars = { version = "1", optional = true }

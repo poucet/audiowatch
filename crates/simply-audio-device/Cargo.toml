@@ -1,0 +1,9 @@
+[package]
+name = "simply-audio-device"
+description = "cpal audio-device helpers: name enumeration and named-device selection (cpal 0.18 description()/name() quirks in one place)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cpal = "0.18.2"

@@ -1,0 +1,18 @@
+[package]
+name = "audiowatch-clock"
+description = "Record in time with a MIDI clock: read its downbeats off a MIDI input and trim takes to the bars between them"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# JSON schemas for the reports, for the MCP surface.
+schema = ["dep:schemars", "audiowatch-record/schema"]
+
+[dependencies]
+audiowatch-record.workspace = true
+simply-midi-clock.workspace = true
+# Input only: listening to the port that is sending clock.
+midir = "0.11.0"
+serde = { workspace = true }
+schemars = { version = "1", optional = true }
