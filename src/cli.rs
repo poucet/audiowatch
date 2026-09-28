@@ -15,6 +15,10 @@ audiowatch -- says which process put audio on this Mac's outputs.
   audiowatch --test-notify       post a notification and check it was delivered
   audiowatch --install-agent     write the LaunchAgent so it runs at login
   audiowatch --paths             where the config and the log live
+  audiowatch --mcp [--port N] [--dir DIR]
+                                 serve the recorder over MCP (default port 3929)
+  audiowatch rec list|clocks|record ...
+                                 record channels of any audio device to WAV
 
 Options
   --all                 include connect/disconnect events, not just sound

@@ -1,0 +1,17 @@
+[package]
+name = "simply-op-macros"
+description = "#[derive(Op)]: read-vs-mutate classification and label templates for operation types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+
+[dev-dependencies]
+simply-history.workspace = true

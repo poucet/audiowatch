@@ -1,0 +1,26 @@
+[package]
+name = "simply-api"
+description = "Service traits with derived MCP tools, dispatch, and clients (runtime for #[api_service])"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+rmcp = { version = "3.1.4", features = ["server"] }
+schemars = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+simply-api-macros.workspace = true
+simply-history.workspace = true
+simply-op-macros.workspace = true
+# `time` only: a `list_changed` notification to a session that opened no
+# event stream must not hold the tier setting up.
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+# `tests/protocol.rs` drives a server over an in-memory sink/stream transport
+# (rmcp's own, ungated) to read the JSON-RPC frames it writes; the channels
+# are `futures`' because that is the Sink/Stream pair that transport takes.
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }

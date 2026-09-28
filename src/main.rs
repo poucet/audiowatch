@@ -24,6 +24,13 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The recorder has its own arguments: `rec ...` and `--mcp ...`.
+    if args.first().map(String::as_str) == Some("rec") {
+        return audiowatch::rec::cli::main(&args[1..]);
+    }
+    if args.iter().any(|a| a == "--mcp") {
+        return audiowatch::rec::server::main(&args);
+    }
     let parsed = match cli::parse(&args) {
         Ok(a) => a,
         Err(e) => {
