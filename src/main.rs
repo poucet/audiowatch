@@ -3,7 +3,6 @@
 //! See README.md for what it detects and, more importantly, what it cannot.
 
 mod agent;
-mod bridge;
 mod cli;
 mod config;
 mod event;
