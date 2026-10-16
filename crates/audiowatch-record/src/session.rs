@@ -17,8 +17,8 @@
 //! 44.1 kHz do not share a sample, and even two devices nominally at 48 kHz
 //! drift apart. So every take gets its own stream, its own ring, its own
 //! writer and its own file at its device's own rate, and nothing is resampled
-//! or summed. The streams are built first and started back to back, which is
-//! as close together as separate clocks can be started.
+//! or summed. The streams are started one after another, as soon as each is
+//! open; separate clocks cannot be started closer than that.
 //!
 //! # What the audio callback does
 //!
@@ -29,9 +29,9 @@
 //! rather than hiding the gap. The writer thread (see [`crate::wav::pump`])
 //! does the file I/O.
 //!
-//! The streams live on a thread of their own for the recording's whole life,
-//! because a cpal stream is not promised to be `Send` on every host; the
-//! handle talks to that thread through a channel.
+//! Every stream is a `simply-audio-capture` capture, input or output tap
+//! alike. They live on a thread of their own for the recording's whole life;
+//! the handle talks to that thread through a channel.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -41,9 +41,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cpal::traits::{DeviceTrait, StreamTrait};
+use simply_audio_capture::{Capture, ErrorKind, Source};
 
-use crate::catalog::{self, choose_rate, pick, route, PickError, Route, RouteRefusal, TapSupport};
+use crate::catalog::{self, choose_rate, pick, route, PickError, Route, RouteRefusal};
 use crate::frames::extract;
 use crate::spec::{Channels, SpecError, TakeSpec};
 use crate::wav::{pump, trim, WavSink};
@@ -167,7 +167,7 @@ pub enum RecordError {
     NoRate { device: String },
     SamePath(String),
     File { path: String, error: String },
-    Stream { take: String, route: Route, error: simply_audio_device::Error },
+    Stream { take: String, route: Route, error: simply_audio_capture::Error },
     Thread,
 }
 
@@ -185,7 +185,9 @@ impl fmt::Display for RecordError {
             }
             RecordError::SamePath(p) => write!(f, "two takes would write the same file {p}"),
             RecordError::File { path, error } => write!(f, "cannot write {path}: {error}"),
-            RecordError::Stream { take, route, error } if error.is_permission_denied() => {
+            RecordError::Stream { take, route, error }
+                if error.kind() == ErrorKind::PermissionDenied =>
+            {
                 write!(f, "{take}: macOS refused access. {}", permission_hint(*route))
             }
             RecordError::Stream { take, error, .. } => write!(f, "{take}: {error}"),
@@ -487,8 +489,7 @@ struct Open {
     /// for a take that is trimmed when it ends.
     written_to: PathBuf,
     timing: Option<rtrb::Consumer<(u64, u64)>>,
-    route: Route,
-    stream: cpal::Stream,
+    capture: Capture,
     writer: JoinHandle<Result<u64, String>>,
     done: Arc<AtomicBool>,
     counters: Arc<Counters>,
@@ -515,14 +516,12 @@ fn run(
         Length::Seconds(s) => (s, false),
         Length::Window => (None, true),
     };
-    let taps = TapSupport::detect();
-    let devices = catalog::devices_with_handles(&taps);
-    let infos: Vec<catalog::DeviceInfo> = devices.iter().map(|(_, i)| i.clone()).collect();
+    let infos = catalog::list_devices();
 
     let mut open: Vec<Open> = Vec::new();
     let mut failure = None;
     for (spec, path) in specs.iter().zip(&paths) {
-        match open_take(spec, path, &devices, &infos, &taps, seconds, windowed) {
+        match open_take(spec, path, &infos, seconds, windowed) {
             Ok(o) => open.push(o),
             Err(e) => {
                 failure = Some(e);
@@ -532,30 +531,7 @@ fn run(
     }
     if let Some(e) = failure {
         for o in open {
-            drop(o.stream);
-            o.done.store(true, Ordering::Release);
-            let _ = o.writer.join();
-            let _ = std::fs::remove_file(&o.written_to);
-        }
-        let _ = ready.send(Err(e));
-        return Outcome::default();
-    }
-
-    // Everything is built: start them back to back.
-    let mut play_error = None;
-    for o in &open {
-        if let Err(e) = o.stream.play() {
-            play_error = Some(RecordError::Stream {
-                take: o.info.spec.clone(),
-                route: o.route,
-                error: simply_audio_device::Error::Cpal(e),
-            });
-            break;
-        }
-    }
-    if let Some(e) = play_error {
-        for o in open {
-            drop(o.stream);
+            drop(o.capture);
             o.done.store(true, Ordering::Release);
             let _ = o.writer.join();
             let _ = std::fs::remove_file(&o.written_to);
@@ -595,6 +571,9 @@ fn run(
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                for o in &open {
+                    note_error(o);
+                }
                 let all_done = match window.as_mut() {
                     Some(w) => w.step(&mut open, &shared.armed_at),
                     None => {
@@ -622,7 +601,8 @@ fn run(
     // Streams first, so nothing more is pushed; then let every writer drain.
     let mut rest = Vec::with_capacity(open.len());
     for o in open {
-        drop(o.stream);
+        note_error(&o);
+        drop(o.capture);
         rest.push((o.info, o.written_to, o.writer, o.done, o.counters));
     }
     for (_, _, _, done, _) in &rest {
@@ -786,19 +766,26 @@ fn frame_limit(seconds: Option<f64>, rate: u32) -> u64 {
     }
 }
 
+/// Copy a stream error the capture reported into the take's counters, where
+/// the handle's status reads it.
+fn note_error(o: &Open) {
+    if let Some(e) = o.capture.error() {
+        if let Ok(mut slot) = o.counters.error.lock() {
+            slot.get_or_insert(e);
+        }
+    }
+}
+
 fn open_take(
     spec: &TakeSpec,
     path: &Path,
-    devices: &[(cpal::Device, catalog::DeviceInfo)],
     infos: &[catalog::DeviceInfo],
-    taps: &TapSupport,
     seconds: Option<f64>,
     windowed: bool,
 ) -> Result<Open, RecordError> {
     let index = pick(infos, &spec.device, spec.direction).map_err(RecordError::Pick)?;
-    let (device, dinfo) = &devices[index];
-    let (route, side) =
-        route(dinfo, spec.direction, spec.channels, taps).map_err(RecordError::Route)?;
+    let dinfo = &infos[index];
+    let (route, side) = route(dinfo, spec.direction, spec.channels).map_err(RecordError::Route)?;
     let rate =
         choose_rate(side).ok_or_else(|| RecordError::NoRate { device: dinfo.name.clone() })?;
     let device_channels = side.channels;
@@ -844,11 +831,10 @@ fn open_take(
     let mut scratch = vec![0.0f32; SCRATCH_FRAMES * count];
     let mut captured = 0u64;
     let data_counters = counters.clone();
-    let data = move |data: &[f32], callback: &cpal::InputCallbackInfo| {
+    let data = move |data: &[f32], ns: u64| {
         if let Some(timing) = timing_tx.as_mut() {
             // Frame index of this buffer's first frame, and when it was
             // captured, on the host clock a window is given in.
-            let ns = callback.timestamp().capture.as_nanos() as u64;
             let _ = timing.push((captured, ns));
         }
         let arrived = (data.len() / width) as u64;
@@ -876,31 +862,20 @@ fn open_take(
             data_counters.overflow.fetch_add(dropped, Ordering::Relaxed);
         }
     };
-    let error_counters = counters.clone();
-    let on_error = move |e: cpal::Error| {
-        if let Ok(mut slot) = error_counters.error.lock() {
-            slot.get_or_insert_with(|| e.to_string());
-        }
+    let source = match route {
+        Route::Input => Source::Input(dinfo.name.clone()),
+        Route::Tap => Source::Tap(dinfo.name.clone()),
     };
-    let config = cpal::StreamConfig {
-        channels: device_channels,
-        sample_rate: rate,
-        buffer_size: cpal::BufferSize::Default,
-    };
-    let stream = match device.build_input_stream::<f32, _, _>(config, data, on_error, None) {
-        Ok(s) => s,
-        Err(e) => {
+    let capture = match simply_audio_capture::start(&source, rate, device_channels, data) {
+        Ok(c) => c,
+        Err(error) => {
             done.store(true, Ordering::Release);
             let _ = writer.join();
             let _ = std::fs::remove_file(&written_to);
-            return Err(RecordError::Stream {
-                take: info.spec,
-                route,
-                error: simply_audio_device::Error::Cpal(e),
-            });
+            return Err(RecordError::Stream { take: info.spec, route, error });
         }
     };
-    Ok(Open { info, written_to, timing, route, stream, writer, done, counters, written })
+    Ok(Open { info, written_to, timing, capture, writer, done, counters, written })
 }
 
 fn result(info: TakeInfo, frames: Result<u64, String>, counters: &Counters) -> TakeResult {
@@ -985,9 +960,7 @@ mod tests {
         let e = RecordError::Stream {
             take: "Yeti:in:1".into(),
             route: Route::Input,
-            error: simply_audio_device::Error::Cpal(cpal::Error::new(
-                cpal::ErrorKind::PermissionDenied,
-            )),
+            error: simply_audio_capture::Error::new(ErrorKind::PermissionDenied, "refused"),
         };
         assert!(e.to_string().contains("Privacy & Security → Microphone"));
         assert!(permission_hint(Route::Tap).contains("System Audio Recording"));

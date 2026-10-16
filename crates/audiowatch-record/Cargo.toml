@@ -12,6 +12,7 @@ schema = ["dep:schemars"]
 
 [dependencies]
 simply-audio-device.workspace = true
+simply-audio-capture.workspace = true
 cpal = "0.18.2"
 # A lock-free ring between the audio callback and a writer thread, and the
 # WAV it writes.

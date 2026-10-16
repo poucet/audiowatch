@@ -196,7 +196,7 @@ flowchart LR
 * It measures the actual signal a process produces, not whether it is running IO.
 * So it would see audio passing through a permanently-open stream.
   * That is the gap above that matters most.
-* Started, not finished: see [Status](#status-done-2026-09-26).
+* Not built: see [Status](#status-done-2026-09-26).
 
 ## Layout
 
@@ -214,13 +214,14 @@ flowchart LR
 | `src/agent.rs` | the LaunchAgent plist |
 | `src/rec/` | the recorder's MCP server (`audiowatch --mcp`) and its command line (`audiowatch rec`) |
 | `crates/audiowatch-record` | the recorder: take specs, which device records in which direction, the writer thread, sessions and the host-time window |
+| `crates/simply-audio-capture` | capture any device by name: its inputs, or for an output-only device a CoreAudio process tap in a private aggregate device; resampled to the rate asked for. No audiowatch types, so it is shared with tussen-hub |
 | `crates/audiowatch-clock` | recording in time with a MIDI clock: the downbeats, the tempo, the MIDI input (feature `midi-clock`) |
 | `crates/simply-*` | device enumeration, MIDI clock messages, and the trait the MCP tools are derived from |
 
 * **The watcher has no dependencies.**
   * It reaches CoreAudio, libproc and libc through the declarations in `src/sys.rs`.
   * Its modules use none of the crates in `Cargo.toml`.
-* **The recorder has some**: `cpal` for devices, `hound` and `rtrb` to write, `midir` for the clock, `rmcp`, `axum` and `tokio` to serve.
+* **The recorder has some**: `cpal` for devices, `objc2` for the output tap, `hound` and `rtrb` to write, `midir` for the clock, `rmcp`, `axum` and `tokio` to serve.
 * `cargo test --workspace` covers the encoding, the filter rules, the log reader, the CLI and the time parsing.
   * Also the whole state machine, including the short-lived-process case.
   * Also the recorder: take specs, routing, the trim to a window, the clock timeline, and the MCP surface over a real socket.
@@ -277,17 +278,16 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.audiowatch.plist
 launchctl bootout   gui/$(id -u)/local.audiowatch    # and to stop it
 ```
 
-### Not yet constructed: the process tap
+### Not built: the per-process tap
 
-* **The process tap was started and is not finished.**
-* `src/tap.rs` and `src/bridge.rs` are in the tree.
-  * Unreferenced, marked `#[allow(dead_code)]` item by item.
-* They are the escalation described in [What still gets past it](#what-still-gets-past-it).
-* They would see audio passing through a **permanently open** stream.
+* **The watcher has no process tap.**
+  * It is the escalation described in [What still gets past it](#what-still-gets-past-it).
+* A tap per process would see audio passing through a **permanently open** stream.
   * The one failure mode this tool cannot detect.
   * The shape `arkaudiod` has on this machine.
-* Nothing else depends on them.
-* Kept rather than deleted, so that route is a resumption, not a rewrite.
+* A first attempt (`src/tap.rs`, a hand-rolled Objective-C bridge in `src/bridge.rs`) was never finished and is gone.
+  * It is in history: commit `znrrvxkw`.
+  * Resuming it means building on `crates/simply-audio-capture`'s tap code, which works, rather than on that bridge.
 
 ## Recording
 
@@ -400,8 +400,10 @@ When something on the desk sends MIDI clock (a drum machine, a groovebox, a DAW)
 
 Measured with `audiowatch rec list`, 2026-09-27.
 
-* **`out` is a CoreAudio tap**, and cpal builds one only for a device with no input side (macOS 14.2+).
-* The rule is in `crates/audiowatch-record/src/catalog.rs` and its tests.
+* **`out` is a CoreAudio process tap** in a private aggregate device, built by `crates/simply-audio-capture` (macOS 14.2+).
+  * Its rule: a device with an input side is captured as an input, so only a device with **no input side** is tapped.
+  * The tap and the aggregate are destroyed when the take ends, and by macOS if the process dies.
+* The refusals are in `crates/audiowatch-record/src/catalog.rs` and its tests.
 
 | device | channels in / out | `in` | `out` | lever for 🚫 |
 |---|---|---|---|---|
@@ -448,9 +450,8 @@ cargo test -p audiowatch-record -- --ignored         # a take trimmed to a windo
 
 ### The recorder and the process tap
 
-* cpal's `out` tap is **one tap per output device, of every process together**.
+* The recorder's `out` tap is **one tap per output device, of every process together**.
   * It records what goes out to a device. It cannot say which process put it there.
-* So it does **not** cover `src/tap.rs` / `src/bridge.rs`.
-  * Those build one tap **per process** in one aggregate, so buffer *i* is process *i*.
-  * That is what would meter audio passing through a permanently open stream, per process.
-* They stay unfinished and unreferenced, as [Not yet constructed](#not-yet-constructed-the-process-tap) says.
+* So it is **not** the watcher's missing per-process tap.
+  * That would be one tap **per process** in one aggregate, so buffer *i* is process *i*.
+  * See [Not built](#not-built-the-per-process-tap).

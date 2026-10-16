@@ -5,20 +5,20 @@
 //! Recording **in** is ordinary: open the device's input side.
 //!
 //! Recording **out** — what the computer is sending *to* a device — needs the
-//! OS to hand back a copy of the output. On macOS 14.2+ cpal does that with a
-//! CoreAudio *process tap* wrapped in a private aggregate device, and it
-//! builds one **only when the device has no input side at all**
-//! (`cpal/src/host/coreaudio/macos/device.rs`: `if self.supports_input() {…}
-//! else { loopback }`). For a duplex device — an audio interface, a mixer,
-//! BlackHole — asking to record it opens its *input* instead. So:
+//! OS to hand back a copy of the output. `simply-audio-capture` does that
+//! with a CoreAudio *process tap* in a private aggregate device (macOS
+//! 14.2+), and its rule is that a device with an input side is captured as
+//! an input, so only a device with **no input side at all** is tapped. For a
+//! duplex device — an audio interface, a mixer, BlackHole — asking to record
+//! it records its *input*. So:
 //!
 //! - an output-only device (built-in speakers, a display, headphones) can be
 //!   tapped;
 //! - a virtual loopback device (BlackHole, Loopback) never needs a tap: what
 //!   was sent to it comes straight back on its input, so record it `in`;
-//! - a hardware interface's outputs cannot be recorded through cpal at all.
-//!   The lever is routing: send the audio to BlackHole or Loopback as well
-//!   (a Multi-Output Device, or Loopback's monitoring), and record that.
+//! - a hardware interface's outputs cannot be tapped. The lever is routing:
+//!   send the audio to BlackHole or Loopback as well (a Multi-Output Device,
+//!   or Loopback's monitoring), and record that.
 //!
 //! [`route`] is that decision as a pure function over [`DeviceInfo`], so the
 //! refusals are tested without a device in the room and say the lever by name.
@@ -72,39 +72,6 @@ pub struct DeviceInfo {
     pub notes: Vec<String>,
 }
 
-/// Whether this Mac can tap an output device at all.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TapSupport {
-    Yes,
-    /// Older than macOS 14.2; carries the version it reported.
-    TooOld(String),
-    /// Not macOS, or the version could not be read: let the backend decide.
-    Unknown,
-}
-
-impl TapSupport {
-    /// Ask the OS. On macOS this reads `sw_vers -productVersion`.
-    pub fn detect() -> TapSupport {
-        if !cfg!(target_os = "macos") {
-            return TapSupport::Unknown;
-        }
-        let Ok(out) = std::process::Command::new("sw_vers").arg("-productVersion").output() else {
-            return TapSupport::Unknown;
-        };
-        TapSupport::from_version(String::from_utf8_lossy(&out.stdout).trim())
-    }
-
-    /// Classify a macOS product version string: taps need 14.2 or later.
-    pub fn from_version(version: &str) -> TapSupport {
-        let mut parts = version.split('.').map(|p| p.parse::<u32>().ok());
-        match (parts.next().flatten(), parts.next().flatten().or(Some(0))) {
-            (Some(major), Some(minor)) if (major, minor) >= (14, 2) => TapSupport::Yes,
-            (Some(_), Some(_)) => TapSupport::TooOld(version.to_string()),
-            _ => TapSupport::Unknown,
-        }
-    }
-}
-
 /// How a take reaches its audio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -122,7 +89,6 @@ pub enum RouteRefusal {
     NoInput { device: String },
     NoOutput { device: String },
     NotTappable { device: String },
-    TapsUnavailable { device: String, version: String },
     Channels { device: String, direction: Direction, keep: Channels, available: u16 },
 }
 
@@ -141,18 +107,12 @@ impl fmt::Display for RouteRefusal {
             ),
             RouteRefusal::NotTappable { device } => write!(
                 f,
-                "{device:?} has an input side, and CoreAudio (through cpal) only taps devices \
-                 that have none — asking to record it records its input instead. If it is a \
+                "{device:?} has an input side, and only a device with none is tapped — \
+                 asking to record it records its input instead. If it is a \
                  loopback device (BlackHole, Loopback), its input IS what was sent to it: use \
                  \"{device}:in:…\". If it is a hardware interface, route what you want to \
                  capture to BlackHole 16ch or a Loopback device as well (a Multi-Output \
                  Device in Audio MIDI Setup, or Loopback's monitors) and record that one's input."
-            ),
-            RouteRefusal::TapsUnavailable { device, version } => write!(
-                f,
-                "recording the output of {device:?} needs a CoreAudio process tap, which needs \
-                 macOS 14.2 or later; this Mac reports {version}. Route the audio through \
-                 BlackHole or Loopback and record that device's input instead."
             ),
             RouteRefusal::Channels { device, direction, keep, available } => {
                 let pairs: Vec<String> =
@@ -175,7 +135,6 @@ pub fn route<'a>(
     info: &'a DeviceInfo,
     dir: Direction,
     keep: Channels,
-    taps: &TapSupport,
 ) -> Result<(Route, &'a SideInfo), RouteRefusal> {
     let device = info.name.clone();
     let (route, side) = match dir {
@@ -186,12 +145,7 @@ pub fn route<'a>(
         Direction::Output => match (&info.input, &info.output) {
             (_, None) => return Err(RouteRefusal::NoOutput { device }),
             (Some(_), Some(_)) => return Err(RouteRefusal::NotTappable { device }),
-            (None, Some(side)) => {
-                if let TapSupport::TooOld(version) = taps {
-                    return Err(RouteRefusal::TapsUnavailable { device, version: version.clone() });
-                }
-                (Route::Tap, side)
-            }
+            (None, Some(side)) => (Route::Tap, side),
         },
     };
     if !keep.fits(side.channels) {
@@ -249,16 +203,11 @@ fn side_info(device: &cpal::Device, dir: Direction) -> Option<SideInfo> {
 }
 
 /// Fill `record_in`, `record_out` and `notes` from the two sides.
-pub fn describe(
-    name: String,
-    input: Option<SideInfo>,
-    output: Option<SideInfo>,
-    taps: &TapSupport,
-) -> DeviceInfo {
+pub fn describe(name: String, input: Option<SideInfo>, output: Option<SideInfo>) -> DeviceInfo {
     let mut info =
         DeviceInfo { name, input, output, record_in: false, record_out: false, notes: Vec::new() };
     info.record_in = info.input.is_some();
-    match route(&info, Direction::Output, Channels::Mono(1), taps) {
+    match route(&info, Direction::Output, Channels::Mono(1)) {
         Ok(_) => info.record_out = true,
         Err(RouteRefusal::NoOutput { .. }) => {}
         Err(refusal) => info.notes.push(format!("out: {refusal}")),
@@ -268,23 +217,14 @@ pub fn describe(
 
 /// Every device on the default host, with both sides described.
 pub fn list_devices() -> Vec<DeviceInfo> {
-    let taps = TapSupport::detect();
-    devices_with_handles(&taps).into_iter().map(|(_, info)| info).collect()
-}
-
-pub(crate) fn devices_with_handles(taps: &TapSupport) -> Vec<(cpal::Device, DeviceInfo)> {
     let host = cpal::default_host();
     let Ok(devices) = host.devices() else { return Vec::new() };
     devices
         .filter_map(|d| {
             let name = device_name(&d)?;
-            let info = describe(
-                name,
-                side_info(&d, Direction::Input),
-                side_info(&d, Direction::Output),
-                taps,
-            );
-            (info.input.is_some() || info.output.is_some()).then_some((d, info))
+            let info =
+                describe(name, side_info(&d, Direction::Input), side_info(&d, Direction::Output));
+            (info.input.is_some() || info.output.is_some()).then_some(info)
         })
         .collect()
 }
@@ -363,14 +303,13 @@ pub(crate) mod tests {
 
     /// The shape of Chris's desk, by the numbers `system_profiler` reports.
     pub(crate) fn desk() -> Vec<DeviceInfo> {
-        let t = TapSupport::Yes;
         vec![
-            describe("ZOOM L6max".into(), Some(side(14, 48_000)), Some(side(4, 48_000)), &t),
-            describe("BlackHole 16ch".into(), Some(side(16, 48_000)), Some(side(16, 48_000)), &t),
-            describe("Scarlett 4i4 USB".into(), Some(side(6, 48_000)), Some(side(4, 48_000)), &t),
-            describe("MacBook Pro Speakers".into(), None, Some(side(2, 48_000)), &t),
-            describe("MacBook Pro Microphone".into(), Some(side(1, 48_000)), None, &t),
-            describe("Speakers".into(), Some(side(2, 44_100)), Some(side(2, 44_100)), &t),
+            describe("ZOOM L6max".into(), Some(side(14, 48_000)), Some(side(4, 48_000))),
+            describe("BlackHole 16ch".into(), Some(side(16, 48_000)), Some(side(16, 48_000))),
+            describe("Scarlett 4i4 USB".into(), Some(side(6, 48_000)), Some(side(4, 48_000))),
+            describe("MacBook Pro Speakers".into(), None, Some(side(2, 48_000))),
+            describe("MacBook Pro Microphone".into(), Some(side(1, 48_000)), None),
+            describe("Speakers".into(), Some(side(2, 44_100)), Some(side(2, 44_100))),
         ]
     }
 
@@ -378,9 +317,9 @@ pub(crate) mod tests {
     fn a_duplex_mixer_records_in_and_names_the_lever_for_out() {
         let d = &desk()[0];
         assert!(d.record_in && !d.record_out);
-        let (r, s) = route(d, Direction::Input, Channels::Pair(13), &TapSupport::Yes).unwrap();
+        let (r, s) = route(d, Direction::Input, Channels::Pair(13)).unwrap();
         assert_eq!((r, s.channels), (Route::Input, 14));
-        let err = route(d, Direction::Output, Channels::Pair(1), &TapSupport::Yes).unwrap_err();
+        let err = route(d, Direction::Output, Channels::Pair(1)).unwrap_err();
         assert!(matches!(err, RouteRefusal::NotTappable { .. }));
         assert!(err.to_string().contains("BlackHole"));
         assert!(d.notes[0].starts_with("out: "));
@@ -390,34 +329,16 @@ pub(crate) mod tests {
     fn an_output_only_device_is_tapped() {
         let d = &desk()[3];
         assert!(!d.record_in && d.record_out && d.notes.is_empty());
-        let (r, _) = route(d, Direction::Output, Channels::Pair(1), &TapSupport::Yes).unwrap();
+        let (r, _) = route(d, Direction::Output, Channels::Pair(1)).unwrap();
         assert_eq!(r, Route::Tap);
-        let err = route(d, Direction::Input, Channels::Pair(1), &TapSupport::Yes).unwrap_err();
+        let err = route(d, Direction::Input, Channels::Pair(1)).unwrap_err();
         assert!(err.to_string().contains(":out:"));
-    }
-
-    #[test]
-    fn a_tap_on_an_old_macos_is_refused_with_the_version() {
-        let old = TapSupport::from_version("14.1.2");
-        assert_eq!(old, TapSupport::TooOld("14.1.2".into()));
-        let d = &desk()[3];
-        let err = route(d, Direction::Output, Channels::Pair(1), &old).unwrap_err();
-        assert!(err.to_string().contains("14.2") && err.to_string().contains("14.1.2"));
-    }
-
-    #[test]
-    fn macos_versions_classify() {
-        assert_eq!(TapSupport::from_version("14.2"), TapSupport::Yes);
-        assert_eq!(TapSupport::from_version("26.0.1"), TapSupport::Yes);
-        assert_eq!(TapSupport::from_version("15"), TapSupport::Yes);
-        assert!(matches!(TapSupport::from_version("13.6"), TapSupport::TooOld(_)));
-        assert_eq!(TapSupport::from_version(""), TapSupport::Unknown);
     }
 
     #[test]
     fn a_channel_past_the_device_lists_the_pairs_it_has() {
         let d = &desk()[2];
-        let err = route(d, Direction::Input, Channels::Pair(7), &TapSupport::Yes).unwrap_err();
+        let err = route(d, Direction::Input, Channels::Pair(7)).unwrap_err();
         let text = err.to_string();
         assert!(text.contains("6 channel") && text.contains("1-2, 3-4, 5-6"), "{text}");
     }
@@ -434,10 +355,9 @@ pub(crate) mod tests {
 
     #[test]
     fn one_name_on_two_devices_resolves_to_the_side_asked_for() {
-        let t = TapSupport::Yes;
         let d = vec![
-            describe("Yeti".into(), Some(side(2, 48_000)), None, &t),
-            describe("Yeti".into(), None, Some(side(2, 48_000)), &t),
+            describe("Yeti".into(), Some(side(2, 48_000)), None),
+            describe("Yeti".into(), None, Some(side(2, 48_000))),
         ];
         assert_eq!(pick(&d, "Yeti", Direction::Input), Ok(0));
         assert_eq!(pick(&d, "Yeti", Direction::Output), Ok(1));

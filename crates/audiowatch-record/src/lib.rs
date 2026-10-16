@@ -22,7 +22,8 @@
 //! that falls inside it, to the frame.
 //!
 //! Nothing here ever opens an **output** stream. Recording what goes out to a
-//! speaker is an *input* stream on a CoreAudio tap (see [`catalog`]).
+//! speaker is a CoreAudio process tap read like an input; every stream, in or
+//! out, is a `simply_audio_capture` capture (see [`catalog`]).
 
 #![forbid(unsafe_code)]
 
@@ -32,7 +33,7 @@ pub mod session;
 pub mod spec;
 pub mod wav;
 
-pub use catalog::{list_devices, DeviceInfo, Route, SideInfo, TapSupport};
+pub use catalog::{list_devices, DeviceInfo, Route, SideInfo};
 pub use session::{
     frame_at, parse_takes, Outcome, RecordError, Recording, RecordingStatus, TakeInfo, TakeResult,
     TakeStatus, TakeSync, TakeWindow,
