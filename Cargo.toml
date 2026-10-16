@@ -55,6 +55,7 @@ members = [
     "crates/audiowatch-record",
     "crates/audiowatch-clock",
     "crates/simply-audio-device",
+    "crates/simply-audio-capture",
     "crates/simply-midi-clock",
     "crates/simply-api",
     "crates/simply-api-macros",
@@ -71,6 +72,7 @@ license = "MIT"
 audiowatch-record = { path = "crates/audiowatch-record" }
 audiowatch-clock = { path = "crates/audiowatch-clock" }
 simply-audio-device = { path = "crates/simply-audio-device" }
+simply-audio-capture = { path = "crates/simply-audio-capture" }
 simply-midi-clock = { path = "crates/simply-midi-clock" }
 simply-api = { path = "crates/simply-api" }
 simply-api-macros = { path = "crates/simply-api-macros" }

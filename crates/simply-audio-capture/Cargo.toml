@@ -1,0 +1,19 @@
+[package]
+name = "simply-audio-capture"
+description = "Capture any audio device by name: its inputs through cpal, or, for an output-only device, what is played on it through a CoreAudio process tap; resampled to the rate asked for"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cpal = "0.18.2"
+
+# The output tap (macOS 14.2+). CATapDescription is an Objective-C class,
+# hence objc2; libc for the read-only TCC check.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-core-foundation = "0.3"
+objc2-core-audio = "0.3"
+objc2-core-audio-types = "0.3"
+libc = "0.2"
