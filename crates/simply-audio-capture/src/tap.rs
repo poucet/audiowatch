@@ -886,9 +886,14 @@ mod tests {
     /// Follows a real app tap of everything except this process, then
     /// stops it: the private aggregate must be gone. Ignored for the same
     /// reason as the next one.
+    /// The two real-tap tests count aggregates by name, so they must not
+    /// overlap: cargo runs tests in parallel by default.
+    static REAL_TAP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     #[ignore]
     fn an_app_tap_leaves_no_aggregate_device_behind() {
+        let _serial = REAL_TAP.lock().unwrap_or_else(|e| e.into_inner());
         let ours = || list_devices().unwrap().iter().filter(|o| o.name == AGGREGATE_NAME).count();
         let tap = AppTap::all_except([crate::App::This]);
         let f = Following::start(tap, 48_000, 2, Box::new(|_: &[f32], _: u64| {})).unwrap();
@@ -906,6 +911,7 @@ mod tests {
     #[test]
     #[ignore]
     fn a_tap_leaves_no_aggregate_device_behind() {
+        let _serial = REAL_TAP.lock().unwrap_or_else(|e| e.into_inner());
         let ours = || list_devices().unwrap().iter().filter(|o| o.name == AGGREGATE_NAME).count();
         eprintln!("permission: {:?}", permission());
         let tap = OutputTap::start("", 48_000, 2, Box::new(|_: &[f32], _: u64| {})).unwrap();
