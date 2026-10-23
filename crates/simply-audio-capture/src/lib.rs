@@ -26,6 +26,36 @@
 //! # Ok::<(), simply_audio_capture::Error>(())
 //! ```
 //!
+//! # Tapping applications
+//!
+//! [`start_app`] taps **applications** rather than a device, so an app's
+//! audio reaches this process without Loopback or BlackHole (macOS 14.2+):
+//!
+//! * [`Apps::Only`]: these apps (by bundle id, executable name or pid; one
+//!   or several), mixed to stereo, wherever they play;
+//! * [`Apps::AllExcept`]: every process except these (leave yourself out,
+//!   [`App::This`], so your own output doesn't feed back).
+//!
+//! The capture **follows** the apps. While none of them runs it reports
+//! [`AppStatus::Waiting`] ("waiting for djay Pro"); it attaches when one
+//! starts, and makes a new tap when one restarts (a new process is a new
+//! HAL process object). A tapped app that exits, a clock device that
+//! disappears, or a tap that stops calling back is reported in
+//! [`AppCapture::status`] and [`AppCapture::error`], never as silence. The
+//! tap is clocked by the default output at the moment it is made.
+//! [`Mute`] chooses whether the app stays audible while tapped.
+//! [`list_apps`] lists what can be tapped, for a picker.
+//!
+//! ```no_run
+//! use simply_audio_capture::{App, AppTap, Mute};
+//! let tap = AppTap::only([App::parse("com.algoriddim.djay-iphone-free")]).with_mute(Mute::Unmuted);
+//! let capture = simply_audio_capture::start_app(&tap, 48_000, 2, |frames: &[f32], _ns: u64| {
+//!     // the same sink as `start`'s: interleaved stereo at 48 kHz, host-clock ns
+//! })?;
+//! println!("{}", capture.status()); // "waiting for com.algoriddim.djay-iphone-free", or "tapping djay Pro (pid 412) at 48000 Hz"
+//! # Ok::<(), simply_audio_capture::Error>(())
+//! ```
+//!
 //! # The sink
 //!
 //! `sink(frames, capture_ns)` gets interleaved `channels`-wide frames at the
@@ -37,7 +67,7 @@
 //!
 //! # Cleanup
 //!
-//! Dropping the [`Capture`] stops it: once the drop returns the sink is never
+//! Dropping the [`Capture`] (or [`AppCapture`]) stops it: once the drop returns the sink is never
 //! called again, and a tap's aggregate device and tap are destroyed. A
 //! private tap and aggregate also belong to the process that made them, so
 //! coreaudiod removes them when the process dies without dropping (a
@@ -53,8 +83,11 @@
 //! This crate knows nothing of the program that uses it, so it can be copied
 //! between programs verbatim.
 
+mod apps;
 #[cfg(target_os = "macos")]
 mod tap;
+
+pub use apps::{App, AppInfo, AppStatus, AppTap, Apps, Mute};
 
 use std::fmt;
 use std::sync::mpsc;
@@ -241,9 +274,15 @@ impl Capture {
     }
 
     /// The first error the stream reported while running (device unplugged,
-    /// …), if any.
+    /// …), if any. For a tap: the tapped device disappeared, or the tap
+    /// stopped delivering audio for two seconds. It stays set.
     pub fn error(&self) -> Option<String> {
-        self.error.lock().ok().and_then(|e| e.clone())
+        let mut slot = self.error.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(target_os = "macos")]
+        if let (None, Running::Tap(t)) = (&*slot, &self.running) {
+            *slot = t.health();
+        }
+        slot.clone()
     }
 }
 
@@ -304,6 +343,91 @@ where
 }
 
 type Sink = Box<dyn FnMut(&[f32], u64) + Send>;
+
+/// Every process the HAL knows plays (or can play) audio, playing ones
+/// first: what an app picker shows. [`AppInfo::app`] is what to tap it by.
+/// Needs no permission. Empty off macOS.
+pub fn list_apps() -> Vec<AppInfo> {
+    #[cfg(target_os = "macos")]
+    return tap::list_apps();
+    #[cfg(not(target_os = "macos"))]
+    return Vec::new();
+}
+
+/// A running app tap (see [`start_app`]). Dropping it stops it: once the
+/// drop returns the sink is never called again, and the tap and its
+/// aggregate device are destroyed.
+pub struct AppCapture {
+    tap: AppTap,
+    #[cfg(target_os = "macos")]
+    following: tap::Following,
+}
+
+impl AppCapture {
+    /// What was asked for.
+    pub fn tap(&self) -> &AppTap {
+        &self.tap
+    }
+
+    /// Tapping, waiting for the app, or failed (and retrying). Cheap: read
+    /// it as often as a UI repaints.
+    pub fn status(&self) -> AppStatus {
+        #[cfg(target_os = "macos")]
+        return self.following.status();
+        #[cfg(not(target_os = "macos"))]
+        unreachable!("an AppCapture is only made on macOS")
+    }
+
+    /// The problem right now, if there is one: the tapped app exited (and
+    /// is waited for), its tap failed, or its clock device disappeared.
+    /// None while tapping, and while waiting for an app that was never
+    /// there. Unlike [`Capture::error`] it clears when the tap recovers.
+    pub fn error(&self) -> Option<String> {
+        match self.status() {
+            AppStatus::Tapping { .. } | AppStatus::Waiting { reason: None, .. } => None,
+            AppStatus::Waiting { reason: Some(r), .. } => Some(r),
+            AppStatus::Failed { error } => Some(error),
+        }
+    }
+}
+
+/// Tap applications rather than a device: `tap` names them (or the ones to
+/// leave out), and the capture follows them. `channels`-wide frames at
+/// `rate` into `sink`, exactly as [`start`]'s (see the crate docs).
+///
+/// Returns once it has looked: tapping, or waiting for an app that isn't
+/// running. Fails when System Audio Recording is known to be denied, when
+/// [`Apps::Only`] names nothing, off macOS, or when the first tap could
+/// not be made.
+pub fn start_app<F>(tap: &AppTap, rate: u32, channels: u16, sink: F) -> Result<AppCapture, Error>
+where
+    F: FnMut(&[f32], u64) + Send + 'static,
+{
+    if matches!(&tap.apps, Apps::Only(a) if a.is_empty()) {
+        return Err(Error::new(ErrorKind::NotFound, "an app tap needs at least one app"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if tap::permission() == Permission::Denied {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!("tapping an app needs System Audio Recording permission, which is denied: {GRANT_HINT}"),
+            ));
+        }
+        let following = tap::Following::start(
+            tap.clone(),
+            rate.max(1),
+            channels.max(1) as usize,
+            Box::new(sink),
+        )?;
+        Ok(AppCapture { tap: tap.clone(), following })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (rate, channels, sink);
+        Err(Error::new(ErrorKind::Unsupported, "tapping an app needs macOS 14.2+"))
+    }
+}
 
 fn device_name(d: &cpal::Device) -> Option<String> {
     d.description().ok().map(|d| d.name().to_string())
@@ -402,6 +526,12 @@ impl Feed {
             (from_hz != to_hz).then(|| Resampler::new(from_hz as f64, to_hz as f64, channels));
         let out = if resampler.is_some() { vec![0.0; CHUNK_FRAMES * channels] } else { Vec::new() };
         Feed { sink, channels, from_hz: from_hz as f64, resampler, out }
+    }
+
+    /// The sink back, for the next tap (an app tap re-made after a restart).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn into_sink(self) -> Sink {
+        self.sink
     }
 
     /// `frames`: interleaved, `channels` wide, at the device's rate; `ns`:

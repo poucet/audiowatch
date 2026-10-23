@@ -1,6 +1,6 @@
 [package]
 name = "simply-audio-capture"
-description = "Capture any audio device by name: its inputs through cpal, or, for an output-only device, what is played on it through a CoreAudio process tap; resampled to the rate asked for"
+description = "Capture any audio device by name: its inputs through cpal, or, for an output-only device, what is played on it through a CoreAudio process tap; or tap applications, followed as they come and go; resampled to the rate asked for"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

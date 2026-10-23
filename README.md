@@ -214,7 +214,7 @@ flowchart LR
 | `src/agent.rs` | the LaunchAgent plist |
 | `src/rec/` | the recorder's MCP server (`audiowatch --mcp`) and its command line (`audiowatch rec`) |
 | `crates/audiowatch-record` | the recorder: take specs, which device records in which direction, the writer thread, sessions and the host-time window |
-| `crates/simply-audio-capture` | capture any device by name: its inputs, or for an output-only device a CoreAudio process tap in a private aggregate device; resampled to the rate asked for. No audiowatch types, so it is shared with tussen-hub |
+| `crates/simply-audio-capture` | capture any device by name: its inputs, or for an output-only device a CoreAudio process tap in a private aggregate device; or **applications** (one app, several, or everything except some), followed as they quit and relaunch; resampled to the rate asked for. No audiowatch types, so it is shared with tussen-hub |
 | `crates/audiowatch-clock` | recording in time with a MIDI clock: the downbeats, the tempo, the MIDI input (feature `midi-clock`) |
 | `crates/simply-*` | device enumeration, MIDI clock messages, and the trait the MCP tools are derived from |
 
@@ -455,3 +455,34 @@ cargo test -p audiowatch-record -- --ignored         # a take trimmed to a windo
 * So it is **not** the watcher's missing per-process tap.
   * That would be one tap **per process** in one aggregate, so buffer *i* is process *i*.
   * See [Not built](#not-built-the-per-process-tap).
+
+### Tapping applications (`simply-audio-capture`)
+
+`simply_audio_capture::start_app` taps **applications** rather than a device (macOS 14.2+), so one app's audio reaches a program without Loopback or BlackHole. The recorder does not use it yet; tussen is the consumer.
+
+| kind | what it taps | `AppTap` |
+|---|---|---|
+| only | these apps, mixed to stereo, on whatever device they play | `AppTap::only([App::parse("com.algoriddim.djay-iphone-free")])` |
+| everything except | every process but these (leave yourself out to avoid feedback) | `AppTap::all_except([App::This])` |
+
+* **Naming an app**: `App::parse` reads a bundle id (`com.algoriddim.djay-iphone-free`, which also matches its helpers' `….helper` ids), a pid, or an executable name (`djay Pro`, case-insensitive).
+  * A pid goes through `kAudioHardwarePropertyTranslatePIDToProcessObject`. A pid doesn't survive a restart; a name or bundle id does.
+* **It follows the app.**
+  * Not running: the status is `waiting for djay Pro`.
+  * It attaches when the app starts, and makes a new tap when the app restarts and its HAL process object changes.
+  * It wakes on the HAL's process-list notification, with a 500 ms poll as the backstop, as the watcher does.
+* **It reports, never goes silent.** `AppCapture::status()` and `error()` say when the tapped app exited, the tap could not be made (retried every 3 s), the device it is clocked by disappeared, or the tap stopped calling back for 2 s. The device tap's `Capture::error()` now reports the last two as well.
+* **`Mute`**: `Unmuted` (the default: the room still hears it), `Muted` (captured silently), `MutedWhenTapped`.
+* **Clock**: the tap runs in a private aggregate clocked by the default output at the moment it is made, at that device's rate, resampled to the rate asked for. Same sink, same host-clock timestamps as a device capture.
+* **`list_apps()`**: every audio client that plays or can play, playing ones first, with pid, bundle id and executable. `AppInfo::app()` is what to tap it by. Needs no permission.
+* **Limits**: the apps are mixed into one stereo stream, so this is still not the watcher's per-process attribution. An app whose audio is played by a process with another bundle id (Safari's `com.apple.WebKit.GPU`) needs that process named too.
+
+Check one by hand (the first run may raise the System Audio Recording prompt):
+
+```sh
+cargo run -p simply-audio-capture --example app_tap -- --list                          # what can be tapped
+cargo run -p simply-audio-capture --example app_tap -- com.algoriddim.djay-iphone-free     # djay only
+cargo run -p simply-audio-capture --example app_tap -- --mute com.algoriddim.djay-iphone-free
+cargo run -p simply-audio-capture --example app_tap -- --except                        # everything but itself
+cargo test -p simply-audio-capture -- --ignored                                        # a real tap leaves no aggregate behind
+```
