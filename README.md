@@ -214,7 +214,7 @@ flowchart LR
 | `src/agent.rs` | the LaunchAgent plist |
 | `src/rec/` | the recorder's MCP server (`audiowatch --mcp`) and its command line (`audiowatch rec`) |
 | `crates/audiowatch-record` | the recorder: take specs, which device records in which direction, the writer thread, sessions and the host-time window |
-| `crates/simply-audio-capture` | capture any device by name: its inputs, or for an output-only device a CoreAudio process tap in a private aggregate device; or **applications** (one app, several, or everything except some), followed as they quit and relaunch; resampled to the rate asked for. No audiowatch types, so it is shared with tussen-hub |
+| `crates/simply-audio-capture` | capture any device by name: its inputs, or for an output-only device a CoreAudio process tap in a private aggregate device (`""`, the default output, follows it when the Mac switches outputs); or **applications** (one app, several, or everything except some), followed as they quit and relaunch; resampled to the rate asked for. No audiowatch types, so it is shared with tussen-hub |
 | `crates/audiowatch-clock` | recording in time with a MIDI clock: the downbeats, the tempo, the MIDI input (feature `midi-clock`) |
 | `crates/simply-*` | device enumeration, MIDI clock messages, and the trait the MCP tools are derived from |
 

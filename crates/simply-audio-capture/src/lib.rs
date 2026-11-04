@@ -9,7 +9,11 @@
 //!   CoreAudio process tap of every process, mixed to stereo and **not
 //!   muted**, inside a private aggregate device this process reads like an
 //!   input (macOS 14.2+);
-//! * `""` is the current default output, tapped.
+//! * `""` is the current default output, tapped, and **followed**: when the
+//!   Mac's default output changes mid-tap the tap moves to the new device
+//!   (a clean restart, the same sink) and the stream carries on.
+//!   [`resolve`] names the default it finds, which is a tap of that one
+//!   device; pass `Source::Tap("")` to [`start`] to follow the default.
 //!
 //! Either way the device runs at its own rate (nothing on the machine is
 //! retuned) and the frames are resampled to the rate asked for, if it
@@ -84,6 +88,9 @@
 //! between programs verbatim.
 
 mod apps;
+// Only the macOS tap drives it; its tests run everywhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod default_out;
 #[cfg(target_os = "macos")]
 mod tap;
 
@@ -117,7 +124,8 @@ pub struct Device {
 pub enum Source {
     /// Read the device's inputs.
     Input(String),
-    /// Tap what is played on this output device (`""` = the default output).
+    /// Tap what is played on this output device (`""` = the default
+    /// output, followed when it changes).
     Tap(String),
 }
 
@@ -249,7 +257,6 @@ pub fn resolve(devices: &[Device], wanted: &str) -> Result<Source, Error> {
 /// A running capture. Dropping it stops it (see the crate docs).
 pub struct Capture {
     source: Source,
-    device_rate: u32,
     error: Arc<Mutex<Option<String>>>,
     running: Running,
 }
@@ -257,26 +264,54 @@ pub struct Capture {
 enum Running {
     /// The cpal stream lives on its own thread (a stream is not `Send` on
     /// every host); closing the channel ends it.
-    Input { stop: Option<mpsc::Sender<()>>, thread: Option<JoinHandle<()>> },
+    Input { stop: Option<mpsc::Sender<()>>, thread: Option<JoinHandle<()>>, device_rate: u32 },
     #[cfg(target_os = "macos")]
-    Tap(#[allow(dead_code)] tap::OutputTap),
+    Tap(tap::OutputTap),
+    /// A tap of the default output, moved to each new default.
+    #[cfg(target_os = "macos")]
+    Default(tap::DefaultTap),
 }
 
 impl Capture {
-    /// What is being captured; a tap of `""` names the device it found.
+    /// What is being captured; a tap of `""` names the device it found when
+    /// it started (see [`device`](Capture::device) for the one now).
     pub fn source(&self) -> &Source {
         &self.source
     }
 
-    /// The rate the device runs at, before resampling.
+    /// The device captured right now. The same as [`source`](Capture::source)'s
+    /// except for a tap of the default output, which moves with the default.
+    pub fn device(&self) -> String {
+        match &self.running {
+            #[cfg(target_os = "macos")]
+            Running::Default(t) => t.now().device,
+            _ => self.source.device().to_owned(),
+        }
+    }
+
+    /// The rate the device runs at, before resampling (for a tap of the
+    /// default output, the one it taps now).
     pub fn device_rate(&self) -> u32 {
-        self.device_rate
+        match &self.running {
+            Running::Input { device_rate, .. } => *device_rate,
+            #[cfg(target_os = "macos")]
+            Running::Tap(t) => t.sample_rate,
+            #[cfg(target_os = "macos")]
+            Running::Default(t) => t.now().device_rate,
+        }
     }
 
     /// The first error the stream reported while running (device unplugged,
     /// …), if any. For a tap: the tapped device disappeared, or the tap
-    /// stopped delivering audio for two seconds. It stays set.
+    /// stopped delivering audio for two seconds. It stays set, except for a
+    /// tap of the default output: that one is the problem right now (the
+    /// new default's tap could not be made, and is retried; the tap's
+    /// health), and clears when the tap recovers.
     pub fn error(&self) -> Option<String> {
+        #[cfg(target_os = "macos")]
+        if let Running::Default(t) = &self.running {
+            return t.now().error;
+        }
         let mut slot = self.error.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(target_os = "macos")]
         if let (None, Running::Tap(t)) = (&*slot, &self.running) {
@@ -288,13 +323,14 @@ impl Capture {
 
 impl Drop for Capture {
     fn drop(&mut self) {
-        if let Running::Input { stop, thread } = &mut self.running {
+        if let Running::Input { stop, thread, .. } = &mut self.running {
             drop(stop.take());
             if let Some(t) = thread.take() {
                 let _ = t.join();
             }
         }
-        // A tap stops and destroys itself when `running` drops.
+        // A tap stops and destroys itself when `running` drops (a followed
+        // one after its thread has stopped).
     }
 }
 
@@ -313,9 +349,8 @@ where
                 start_input(name, rate, channels, Box::new(sink), Arc::clone(&error))?;
             Ok(Capture {
                 source: source.clone(),
-                device_rate,
                 error,
-                running: Running::Input { stop: Some(stop), thread: Some(thread) },
+                running: Running::Input { stop: Some(stop), thread: Some(thread), device_rate },
             })
         }
         #[cfg(target_os = "macos")]
@@ -326,13 +361,16 @@ where
                     format!("tapping an output needs System Audio Recording permission, which is denied: {GRANT_HINT}"),
                 ));
             }
+            if name.is_empty() {
+                let t = tap::DefaultTap::start(rate, channels as usize, Box::new(sink))?;
+                return Ok(Capture {
+                    source: Source::Tap(t.now().device),
+                    error,
+                    running: Running::Default(t),
+                });
+            }
             let t = tap::OutputTap::start(name, rate, channels as usize, Box::new(sink))?;
-            Ok(Capture {
-                source: Source::Tap(t.device.clone()),
-                device_rate: t.sample_rate,
-                error,
-                running: Running::Tap(t),
-            })
+            Ok(Capture { source: Source::Tap(t.device.clone()), error, running: Running::Tap(t) })
         }
         #[cfg(not(target_os = "macos"))]
         Source::Tap(_) => Err(Error::new(

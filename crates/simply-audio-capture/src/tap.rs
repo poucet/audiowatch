@@ -1,5 +1,6 @@
 //! Process taps (macOS 14.2+): capture what the Mac *plays*, either on one
-//! output device ([`OutputTap::start`]) or by chosen processes
+//! output device ([`OutputTap::start`]; [`DefaultTap`] keeps one on
+//! whatever the default output is) or by chosen processes
 //! ([`Kind::Processes`], which [`Following`] keeps pointed at the apps it
 //! follows). No BlackHole, no Multi-Output Device.
 //!
@@ -33,6 +34,7 @@ use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSUUID};
 use crate::apps::{
     self, AppInfo, AppStatus, AppTap, Backend, Follow, Mute, Proc, Stall, Target, STALL,
 };
+use crate::default_out::{FollowDefault, Now, Outputs};
 use crate::{Error, ErrorKind, Feed, Permission, Sink};
 
 type OSStatus = i32;
@@ -635,10 +637,6 @@ impl Wake {
     }
 }
 
-/// The HAL listeners that poke a follower.
-const WATCHED: [AudioObjectPropertySelector; 2] =
-    [kAudioHardwarePropertyProcessObjectList, kAudioHardwarePropertyDevices];
-
 unsafe extern "C-unwind" fn on_change(
     _object: AudioObjectID,
     _count: u32,
@@ -649,67 +647,66 @@ unsafe extern "C-unwind" fn on_change(
     0
 }
 
-/// A running follower: its thread owns the [`Follow`] and the tap.
-pub(crate) struct Following {
+/// A thread that ticks a follower: once at the start, then whenever one of
+/// its HAL properties changes (or [`POLL`] passes), until it is dropped.
+struct Watcher {
     wake: Arc<Wake>,
     /// The pointer the listeners were registered with.
     client: *const Wake,
-    status: Arc<Mutex<AppStatus>>,
+    selectors: &'static [AudioObjectPropertySelector],
     thread: Option<JoinHandle<()>>,
 }
 
 // `client` is only handed to CoreAudio and compared on removal.
-unsafe impl Send for Following {}
-unsafe impl Sync for Following {}
+unsafe impl Send for Watcher {}
+unsafe impl Sync for Watcher {}
 
-impl Following {
-    /// Start following `tap` into `sink`. Returns after the first look:
-    /// tapping, waiting for the app, or the error that stopped the first
-    /// tap being made.
-    pub(crate) fn start(
-        tap: AppTap,
-        rate: u32,
-        channels: usize,
-        sink: Sink,
-    ) -> Result<Following, Error> {
+impl Watcher {
+    /// Run `tick` on a thread called `name`. Returns after the first tick:
+    /// its error is returned (and the thread ends); later ones are the
+    /// follower's own to report.
+    fn start<T>(
+        name: &str,
+        selectors: &'static [AudioObjectPropertySelector],
+        mut tick: T,
+    ) -> Result<Watcher, Error>
+    where
+        T: FnMut(Instant) -> Result<(), Error> + Send + 'static,
+    {
         let wake = Arc::new(Wake::default());
-        let status = Arc::new(Mutex::new(AppStatus::Failed { error: "starting".into() }));
-        let (first_tx, first_rx) = mpsc::channel::<AppStatus>();
+        let (first_tx, first_rx) = mpsc::channel::<Result<(), Error>>();
         let thread = {
-            let (wake, status) = (Arc::clone(&wake), Arc::clone(&status));
+            let wake = Arc::clone(&wake);
             std::thread::Builder::new()
-                .name("audio app tap".into())
+                .name(name.into())
                 .spawn(move || {
-                    let hal = Hal { rate, channels, cache: HashMap::new() };
-                    let mut follow = Follow::new(hal, tap, std::process::id() as i32, sink);
-                    let first = follow.tick(Instant::now()).clone();
-                    *status.lock().unwrap_or_else(|e| e.into_inner()) = first.clone();
-                    let failed = matches!(first, AppStatus::Failed { .. });
+                    let first = tick(Instant::now());
+                    let failed = first.is_err();
                     let _ = first_tx.send(first);
                     if failed {
                         return;
                     }
                     while !wake.wait() {
-                        let now = follow.tick(Instant::now()).clone();
-                        *status.lock().unwrap_or_else(|e| e.into_inner()) = now;
+                        let _ = tick(Instant::now());
                     }
-                    // Dropping the follower destroys its tap.
+                    // Dropping `tick` drops the follower, which destroys
+                    // its tap.
                 })
                 .map_err(|e| {
-                    Error::new(ErrorKind::Device, format!("cannot start the app tap thread: {e}"))
+                    Error::new(ErrorKind::Device, format!("cannot start the {name} thread: {e}"))
                 })?
         };
         match first_rx.recv() {
-            Ok(AppStatus::Failed { error }) => {
+            Ok(Err(e)) => {
                 let _ = thread.join();
-                return Err(Error::new(ErrorKind::Device, error));
+                return Err(e);
             }
-            Ok(_) => {}
+            Ok(Ok(())) => {}
             Err(_) => {
                 let _ = thread.join();
                 return Err(Error::new(
                     ErrorKind::Device,
-                    "the app tap thread died before reporting",
+                    format!("the {name} thread died before reporting"),
                 ));
             }
         }
@@ -717,7 +714,7 @@ impl Following {
         // so the pointer it holds keeps its own reference, never released:
         // one small allocation per capture, never touched once freed.
         let client = Arc::into_raw(Arc::clone(&wake));
-        for selector in WATCHED {
+        for &selector in selectors {
             let addr = address(selector, kAudioObjectPropertyScopeGlobal);
             unsafe {
                 AudioObjectAddPropertyListener(
@@ -728,17 +725,13 @@ impl Following {
                 );
             }
         }
-        Ok(Following { wake, client, status, thread: Some(thread) })
-    }
-
-    pub(crate) fn status(&self) -> AppStatus {
-        self.status.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        Ok(Watcher { wake, client, selectors, thread: Some(thread) })
     }
 }
 
-impl Drop for Following {
+impl Drop for Watcher {
     fn drop(&mut self) {
-        for selector in WATCHED {
+        for &selector in self.selectors {
             let addr = address(selector, kAudioObjectPropertyScopeGlobal);
             unsafe {
                 AudioObjectRemovePropertyListener(
@@ -753,6 +746,121 @@ impl Drop for Following {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+    }
+}
+
+/// What pokes an app follower: a process came or went, a device list
+/// changed.
+const APPS_WATCHED: [AudioObjectPropertySelector; 2] =
+    [kAudioHardwarePropertyProcessObjectList, kAudioHardwarePropertyDevices];
+
+/// A running app follower: its thread owns the [`Follow`] and the tap.
+pub(crate) struct Following {
+    status: Arc<Mutex<AppStatus>>,
+    _watcher: Watcher,
+}
+
+impl Following {
+    /// Start following `tap` into `sink`. Returns after the first look:
+    /// tapping, waiting for the app, or the error that stopped the first
+    /// tap being made.
+    pub(crate) fn start(
+        tap: AppTap,
+        rate: u32,
+        channels: usize,
+        sink: Sink,
+    ) -> Result<Following, Error> {
+        let status = Arc::new(Mutex::new(AppStatus::Failed { error: "starting".into() }));
+        let hal = Hal { rate, channels, cache: HashMap::new() };
+        let mut follow = Follow::new(hal, tap, std::process::id() as i32, sink);
+        let shared = Arc::clone(&status);
+        let watcher = Watcher::start("audio app tap", &APPS_WATCHED, move |now| {
+            let s = follow.tick(now).clone();
+            *shared.lock().unwrap_or_else(|e| e.into_inner()) = s.clone();
+            match s {
+                AppStatus::Failed { error } => Err(Error::new(ErrorKind::Device, error)),
+                _ => Ok(()),
+            }
+        })?;
+        Ok(Following { status, _watcher: watcher })
+    }
+
+    pub(crate) fn status(&self) -> AppStatus {
+        self.status.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// The real [`Outputs`]: device taps on whatever the default output is.
+struct Defaults {
+    rate: u32,
+    channels: usize,
+}
+
+impl Outputs for Defaults {
+    type Tap = OutputTap;
+
+    fn default_output(&mut self) -> Option<u32> {
+        get::<AudioObjectID>(
+            kAudioObjectSystemObject as AudioObjectID,
+            kAudioHardwarePropertyDefaultOutputDevice,
+            kAudioObjectPropertyScopeGlobal,
+        )
+        .ok()
+        .filter(|id| *id != kAudioObjectUnknown)
+    }
+
+    fn open(&mut self, id: u32, sink: Sink) -> Result<(OutputTap, String, u32), (Error, Sink)> {
+        let found = list_devices().map(|d| d.into_iter().find(|d| d.id == id && d.outputs));
+        let device = match found {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                let e = Error::new(ErrorKind::NotFound, "the default output device went away");
+                return Err((e, sink));
+            }
+            Err(e) => return Err((e, sink)),
+        };
+        let tap = OutputTap::open(Kind::Device(device), self.rate, self.channels, sink)?;
+        let (name, rate) = (tap.device.clone(), tap.sample_rate);
+        Ok((tap, name, rate))
+    }
+
+    fn close(&mut self, tap: OutputTap) -> Sink {
+        tap.into_sink()
+    }
+
+    fn health(&mut self, tap: &OutputTap) -> Option<String> {
+        tap.health()
+    }
+}
+
+/// What pokes a default-output follower: the default output changed.
+const DEFAULT_WATCHED: [AudioObjectPropertySelector; 1] =
+    [kAudioHardwarePropertyDefaultOutputDevice];
+
+/// A running tap of the default output that follows it to a new device:
+/// its thread owns the [`FollowDefault`] and the tap.
+pub(crate) struct DefaultTap {
+    now: Arc<Mutex<Now>>,
+    _watcher: Watcher,
+}
+
+impl DefaultTap {
+    /// Tap the default output into `sink`. Returns once audio is flowing,
+    /// or with why not.
+    pub(crate) fn start(rate: u32, channels: usize, sink: Sink) -> Result<DefaultTap, Error> {
+        let now = Arc::new(Mutex::new(Now::default()));
+        let mut follow = FollowDefault::new(Defaults { rate, channels }, sink);
+        let shared = Arc::clone(&now);
+        let watcher = Watcher::start("audio default output tap", &DEFAULT_WATCHED, move |t| {
+            let r = follow.tick(t).map(|_| ());
+            *shared.lock().unwrap_or_else(|e| e.into_inner()) = follow.now().clone();
+            r
+        })?;
+        Ok(DefaultTap { now, _watcher: watcher })
+    }
+
+    pub(crate) fn now(&self) -> Now {
+        self.now.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
