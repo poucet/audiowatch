@@ -1,8 +1,8 @@
 //! What wakes a follower thread, kept free of the HAL so it is tested with
 //! fakes: [`Wake`] (poked by listeners, or the poll passing), the thread
-//! that ticks on it ([`spawn`]), and [`Listened`], which keeps a listener on
-//! each process's devices so a process that moves to another device is
-//! seen at once rather than at the next poll.
+//! that ticks on it ([`spawn`]), and [`Listened`], which keeps listeners on
+//! each process so one that starts or stops playing, or moves to another
+//! device, is seen at once rather than at the next poll.
 
 use std::collections::BTreeSet;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -82,40 +82,57 @@ where
     }
 }
 
-/// Listeners on one property of process objects: on the HAL, the devices
-/// a process plays into; in the tests, a fake.
-pub(crate) trait Listen {
-    /// Start poking the follower when `object`'s devices change.
-    fn add(&mut self, object: u32);
-    /// Stop (the process is gone, or the follower is).
-    fn remove(&mut self, object: u32);
+/// A process object property whose change wakes an app follower.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Prop {
+    /// It started or stopped playing (`kAudioProcessPropertyIsRunningOutput`):
+    /// a new app's channel starts at once rather than at the next poll.
+    Playing,
+    /// It moved to other output devices (`kAudioProcessPropertyDevices`).
+    Devices,
 }
 
-/// A [`Backend`] whose listed processes each carry a [`Listen`]er, kept in
-/// line with the list on every look and removed with the follower. Only
-/// for a tap that reads the devices processes play into (it lists an
-/// [`App::PlayingInto`](crate::App::PlayingInto)); for any other it is the
-/// backend as it is.
+/// Listeners on process object properties: on the HAL, the real ones; in
+/// the tests, a fake.
+pub(crate) trait Listen {
+    /// Start poking the follower when `object`'s `prop` changes.
+    fn add(&mut self, object: u32, prop: Prop);
+    /// Stop (the process is gone, or the follower is).
+    fn remove(&mut self, object: u32, prop: Prop);
+}
+
+/// A [`Backend`] whose listed processes each carry [`Listen`]ers, kept in
+/// line with the list on every look and removed with the follower: on
+/// [`Prop::Playing`] always, and on [`Prop::Devices`] for a tap that reads
+/// the devices processes play into (it lists an
+/// [`App::PlayingInto`](crate::App::PlayingInto)).
 pub(crate) struct Listened<B, L: Listen> {
     inner: B,
-    listen: Option<L>,
+    listen: L,
+    props: Vec<Prop>,
     on: BTreeSet<u32>,
 }
 
 impl<B: Backend, L: Listen> Listened<B, L> {
-    pub(crate) fn new(inner: B, tap: &AppTap, listen: impl FnOnce() -> L) -> Listened<B, L> {
-        let listen = tap.needs_devices().then(listen);
-        Listened { inner, listen, on: BTreeSet::new() }
+    pub(crate) fn new(inner: B, tap: &AppTap, listen: L) -> Listened<B, L> {
+        let mut props = vec![Prop::Playing];
+        if tap.needs_devices() {
+            props.push(Prop::Devices);
+        }
+        Listened { inner, listen, props, on: BTreeSet::new() }
     }
 
     fn sync(&mut self, procs: &[Proc]) {
-        let Some(listen) = &mut self.listen else { return };
         let now: BTreeSet<u32> = procs.iter().map(|p| p.object).collect();
         for &gone in self.on.difference(&now) {
-            listen.remove(gone);
+            for &prop in &self.props {
+                self.listen.remove(gone, prop);
+            }
         }
         for &new in now.difference(&self.on) {
-            listen.add(new);
+            for &prop in &self.props {
+                self.listen.add(new, prop);
+            }
         }
         self.on = now;
     }
@@ -149,9 +166,9 @@ impl<B: Backend, L: Listen> Backend for Listened<B, L> {
 
 impl<B, L: Listen> Drop for Listened<B, L> {
     fn drop(&mut self) {
-        if let Some(listen) = &mut self.listen {
-            for &object in &self.on {
-                listen.remove(object);
+        for &object in &self.on {
+            for &prop in &self.props {
+                self.listen.remove(object, prop);
             }
         }
     }
@@ -164,10 +181,13 @@ mod tests {
     use crate::apps::{App, Follow};
     use std::collections::BTreeMap;
 
-    /// The fake HAL's listener table: whom to wake when a process's devices
-    /// change. Shared between threads, as the HAL's is.
+    /// The fake HAL's listener table: whom to wake when a process's
+    /// property changes. Shared between threads, as the HAL's is.
     #[derive(Clone, Default)]
-    struct Table(Arc<Mutex<BTreeMap<u32, Arc<Wake>>>>);
+    struct Table(Arc<Mutex<Listeners>>);
+
+    /// Whom each process's property wakes.
+    type Listeners = BTreeMap<(u32, Prop), Arc<Wake>>;
 
     struct FakeListen {
         table: Table,
@@ -175,23 +195,24 @@ mod tests {
     }
 
     impl Listen for FakeListen {
-        fn add(&mut self, object: u32) {
-            self.table.0.lock().unwrap().insert(object, Arc::clone(&self.wake));
+        fn add(&mut self, object: u32, prop: Prop) {
+            self.table.0.lock().unwrap().insert((object, prop), Arc::clone(&self.wake));
         }
-        fn remove(&mut self, object: u32) {
-            self.table.0.lock().unwrap().remove(&object);
+        fn remove(&mut self, object: u32, prop: Prop) {
+            self.table.0.lock().unwrap().remove(&(object, prop));
         }
     }
 
     impl Table {
-        /// The HAL says `object`'s devices changed.
-        fn changed(&self, object: u32) {
-            if let Some(w) = self.0.lock().unwrap().get(&object) {
+        /// The HAL says `object`'s `prop` changed.
+        fn changed(&self, object: u32, prop: Prop) {
+            if let Some(w) = self.0.lock().unwrap().get(&(object, prop)) {
                 w.poke(false);
             }
         }
-        fn listened(&self) -> Vec<u32> {
-            self.0.lock().unwrap().keys().copied().collect()
+        /// The processes listened to on `prop`.
+        fn listened(&self, prop: Prop) -> Vec<u32> {
+            self.0.lock().unwrap().keys().filter(|k| k.1 == prop).map(|k| k.0).collect()
         }
     }
 
@@ -240,62 +261,93 @@ mod tests {
         AppTap::all_except([App::This, App::PlayingInto(TUSSEN.into())])
     }
 
+    /// A poll far longer than a test may take: only a listener can wake
+    /// the follower in time.
+    fn no_poll() -> Arc<Wake> {
+        Arc::new(Wake::new(Duration::from_secs(600)))
+    }
+
+    /// Until `done` holds, or fail with `why` after 5 s.
+    fn soon(why: &str, done: impl Fn() -> bool) {
+        let t = Instant::now();
+        while !done() {
+            assert!(t.elapsed() < Duration::from_secs(5), "{why}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn a_process_moving_to_a_tussen_device_wakes_the_follower_without_waiting_for_the_poll() {
-        let (backend, table) = (Shared::default(), Table::default());
+        let (backend, table, wake) = (Shared::default(), Table::default(), no_poll());
         let music = proc(3, 5, MUSIC, "/x/Music");
         backend.0.lock().unwrap().procs = vec![proc(10, 412, DJAY, DJAY_EXE), music.clone()];
-        // A poll far longer than the test may take: only a listener can
-        // wake the follower in time.
-        let wake = Arc::new(Wake::new(Duration::from_secs(600)));
         let listen = FakeListen { table: table.clone(), wake: Arc::clone(&wake) };
-        let listened = Listened::new(backend.clone(), &tussen_tap(), || listen);
+        let listened = Listened::new(backend.clone(), &tussen_tap(), listen);
         let mut follow = Follow::new(listened, tussen_tap(), ME, Box::new(|_: &[f32], _: u64| {}));
         let thread = spawn("test follower", Arc::clone(&wake), move |now| {
             follow.tick(now);
             Ok(())
         })
         .unwrap();
-        assert_eq!(table.listened(), [3, 10]);
+        assert_eq!(table.listened(Prop::Devices), [3, 10]);
         assert_eq!(backend.0.lock().unwrap().opened.len(), 1);
 
         // Music moves to Tussen In 1, and the HAL says so.
         backend.0.lock().unwrap().procs =
             vec![proc(10, 412, DJAY, DJAY_EXE), plays(music, &[TUSSEN_IN_1])];
-        let t = Instant::now();
-        table.changed(3);
-        while backend.0.lock().unwrap().opened.len() < 2 {
-            assert!(t.elapsed() < Duration::from_secs(5), "the follower was not woken");
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        table.changed(3, Prop::Devices);
+        soon("the follower was not woken", || backend.0.lock().unwrap().opened.len() == 2);
         assert_eq!(
             backend.0.lock().unwrap().opened.last().unwrap().0,
             [Target::AllExcept(vec![3])]
         );
 
-        // Music exits: its listener goes with it (the next look sees it).
+        // Music exits: its listeners go with it (the next look sees it).
         backend.0.lock().unwrap().procs = vec![proc(10, 412, DJAY, DJAY_EXE)];
-        table.changed(3);
-        let t = Instant::now();
-        while table.listened() != [10] {
-            assert!(t.elapsed() < Duration::from_secs(5), "{:?}", table.listened());
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        table.changed(3, Prop::Devices);
+        soon("music's listeners stayed", || {
+            table.listened(Prop::Devices) == [10] && table.listened(Prop::Playing) == [10]
+        });
         // Stopping drops the follower on its thread: every listener goes.
         wake.poke(true);
         thread.join().unwrap();
-        assert!(table.listened().is_empty());
+        assert!(table.0.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn a_tap_that_does_not_read_devices_listens_to_no_process() {
-        let (backend, table) = (Shared::default(), Table::default());
-        backend.0.lock().unwrap().procs = vec![proc(10, 412, DJAY, DJAY_EXE)];
-        let wake = Arc::new(Wake::new(Duration::from_secs(600)));
+    fn an_app_that_starts_playing_gets_its_channel_without_waiting_for_the_poll() {
+        use crate::channels::{AppSinks, Split};
+        struct Quiet;
+        impl AppSinks for Quiet {
+            type Sink = fn(&[f32], u64);
+            fn started(&mut self, _: &crate::AppInfo) -> Self::Sink {
+                |_, _| {}
+            }
+            fn stopped(&mut self, _: &crate::AppInfo) {}
+        }
+        let (backend, table, wake) = (Shared::default(), Table::default(), no_poll());
+        let music = proc(3, 5, MUSIC, "/x/Music");
+        backend.0.lock().unwrap().procs = vec![Proc { playing: false, ..music.clone() }];
         let tap = AppTap::all_except([App::This]);
-        let listen = FakeListen { table: table.clone(), wake };
-        let mut listened = Listened::new(backend, &tap, || listen);
-        listened.processes();
-        assert!(table.listened().is_empty());
+        let listen = FakeListen { table: table.clone(), wake: Arc::clone(&wake) };
+        let mut split = Split::new(Listened::new(backend.clone(), &tap, listen), tap, ME, Quiet);
+        let thread = spawn("test channels", Arc::clone(&wake), move |now| {
+            split.tick(now);
+            Ok(())
+        })
+        .unwrap();
+        // Listened to for playing, not for devices (nothing reads them).
+        assert_eq!(table.listened(Prop::Playing), [3]);
+        assert!(table.listened(Prop::Devices).is_empty());
+        assert!(backend.0.lock().unwrap().opened.is_empty());
+
+        // Music starts playing, and the HAL says so.
+        backend.0.lock().unwrap().procs = vec![music];
+        table.changed(3, Prop::Playing);
+        soon("the follower was not woken", || backend.0.lock().unwrap().opened.len() == 1);
+        assert_eq!(backend.0.lock().unwrap().opened[0].0, [Target::Processes(vec![3])]);
+        wake.poke(true);
+        thread.join().unwrap();
+        assert!(table.0.lock().unwrap().is_empty());
     }
 }

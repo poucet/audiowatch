@@ -36,7 +36,7 @@ use crate::apps::{
 };
 use crate::channels::{AppSinks, ChannelsStatus, Split};
 use crate::default_out::{FollowDefault, Now, Outputs};
-use crate::watch::{self, Listen, Listened, Wake};
+use crate::watch::{self, Listen, Listened, Prop, Wake};
 use crate::{Error, ErrorKind, Feed, Permission, Sink};
 
 type OSStatus = i32;
@@ -825,44 +825,52 @@ impl Drop for Watcher {
     }
 }
 
-/// The HAL's [`Listen`]: wakes the follower when a process object's
-/// `kAudioProcessPropertyDevices` changes (it moved to another device).
-struct DevicesListen {
+/// The HAL's [`Listen`]: wakes the follower when a process object starts
+/// or stops playing, or moves to other devices.
+struct ProcessListen {
     client: *const Wake,
 }
 
 // `client` is only handed to CoreAudio.
-unsafe impl Send for DevicesListen {}
+unsafe impl Send for ProcessListen {}
 
-/// A process's devices, in any scope (output is the one read).
-const DEVICES: (AudioObjectPropertySelector, AudioObjectPropertyScope) =
-    (kAudioProcessPropertyDevices, kAudioObjectPropertyScopeWildcard);
-
-impl Listen for DevicesListen {
-    fn add(&mut self, object: u32) {
-        listener(true, object, DEVICES, self.client);
+impl ProcessListen {
+    fn at(prop: Prop) -> (AudioObjectPropertySelector, AudioObjectPropertyScope) {
+        match prop {
+            Prop::Playing => {
+                (kAudioProcessPropertyIsRunningOutput, kAudioObjectPropertyScopeGlobal)
+            }
+            // In any scope (output is the one read).
+            Prop::Devices => (kAudioProcessPropertyDevices, kAudioObjectPropertyScopeWildcard),
+        }
     }
-    fn remove(&mut self, object: u32) {
-        listener(false, object, DEVICES, self.client);
+}
+
+impl Listen for ProcessListen {
+    fn add(&mut self, object: u32, prop: Prop) {
+        listener(true, object, ProcessListen::at(prop), self.client);
+    }
+    fn remove(&mut self, object: u32, prop: Prop) {
+        listener(false, object, ProcessListen::at(prop), self.client);
     }
 }
 
 /// What pokes an app follower: a process came or went, a device list
-/// changed. (And, for a tap that reads them, a process's devices changed:
-/// [`DevicesListen`].)
+/// changed. (And a process started or stopped playing or, for a tap that
+/// reads them, its devices changed: [`ProcessListen`].)
 const APPS_WATCHED: [AudioObjectPropertySelector; 2] =
     [kAudioHardwarePropertyProcessObjectList, kAudioHardwarePropertyDevices];
 
-/// The backend an app follower runs on: the HAL, with a listener on each
-/// process's devices when the tap reads them.
+/// The backend an app follower runs on: the HAL, with listeners on each
+/// process (see [`Listened`]).
 fn app_backend(
     tap: &AppTap,
     rate: u32,
     channels: usize,
     wake: &Arc<Wake>,
-) -> Listened<Hal, DevicesListen> {
+) -> Listened<Hal, ProcessListen> {
     let hal = Hal { rate, channels, cache: HashMap::new(), devices: tap.needs_devices() };
-    Listened::new(hal, tap, || DevicesListen { client: client_of(wake) })
+    Listened::new(hal, tap, ProcessListen { client: client_of(wake) })
 }
 
 /// A running app follower: its thread owns the [`Follow`] and the tap.
