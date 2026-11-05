@@ -481,7 +481,9 @@ type Identity = (i32, Option<String>, Option<String>);
 /// Every process object the HAL lists, with who it is and whether it is
 /// playing. `cache` keeps identities across calls (pruned to the objects
 /// still listed), so an idle poll costs one property read per process.
-fn list_processes(cache: &mut HashMap<AudioObjectID, Identity>) -> Vec<Proc> {
+/// With `devices`, also the UIDs of the output devices each one plays into
+/// (a few more reads per process).
+fn list_processes(cache: &mut HashMap<AudioObjectID, Identity>, devices: bool) -> Vec<Proc> {
     let objects: Vec<AudioObjectID> = get_vec(
         kAudioObjectSystemObject as AudioObjectID,
         kAudioHardwarePropertyProcessObjectList,
@@ -514,21 +516,32 @@ fn list_processes(cache: &mut HashMap<AudioObjectID, Identity>) -> Vec<Proc> {
         )
         .is_ok_and(|v| v == 1);
         let (pid, bundle, exe) = identity;
-        procs.push(Proc { object, pid, bundle, exe, playing });
+        let devices = match devices {
+            true => output_devices(object)
+                .into_iter()
+                .filter_map(|d| get_string(d, kAudioDevicePropertyDeviceUID).ok())
+                .collect(),
+            false => Vec::new(),
+        };
+        procs.push(Proc { object, pid, bundle, exe, playing, devices });
     }
     procs
 }
 
+/// The output devices a process object plays to.
+fn output_devices(object: AudioObjectID) -> Vec<AudioObjectID> {
+    get_vec(object, kAudioProcessPropertyDevices, kAudioObjectPropertyScopeOutput)
+        .unwrap_or_default()
+}
+
 /// Whether a process object plays to any output device.
 fn has_output(object: AudioObjectID) -> bool {
-    !get_vec::<AudioObjectID>(object, kAudioProcessPropertyDevices, kAudioObjectPropertyScopeOutput)
-        .unwrap_or_default()
-        .is_empty()
+    !output_devices(object).is_empty()
 }
 
 /// The audio clients that play (or can play) audio: what a picker lists.
 pub(crate) fn list_apps() -> Vec<AppInfo> {
-    let procs: Vec<Proc> = list_processes(&mut HashMap::new())
+    let procs: Vec<Proc> = list_processes(&mut HashMap::new(), false)
         .into_iter()
         .filter(|p| p.playing || has_output(p.object))
         .collect();
@@ -567,13 +580,16 @@ struct Hal {
     rate: u32,
     channels: usize,
     cache: HashMap<AudioObjectID, Identity>,
+    /// Read the devices each process plays into (the tap lists an
+    /// [`App::PlayingInto`](crate::App::PlayingInto)).
+    devices: bool,
 }
 
 impl Backend for Hal {
     type Tap = OutputTap;
 
     fn processes(&mut self) -> Vec<Proc> {
-        list_processes(&mut self.cache)
+        list_processes(&mut self.cache, self.devices)
     }
 
     fn translate(&mut self, pid: i32) -> Option<u32> {
@@ -771,7 +787,7 @@ impl Following {
         sink: Sink,
     ) -> Result<Following, Error> {
         let status = Arc::new(Mutex::new(AppStatus::Failed { error: "starting".into() }));
-        let hal = Hal { rate, channels, cache: HashMap::new() };
+        let hal = Hal { rate, channels, cache: HashMap::new(), devices: tap.needs_devices() };
         let mut follow = Follow::new(hal, tap, std::process::id() as i32, sink);
         let shared = Arc::clone(&status);
         let watcher = Watcher::start("audio app tap", &APPS_WATCHED, move |now| {
@@ -980,10 +996,11 @@ mod tests {
     /// listed pid gives its object back.
     #[test]
     fn the_hal_lists_audio_processes_and_translates_their_pids() {
-        let procs = list_processes(&mut HashMap::new());
+        let procs = list_processes(&mut HashMap::new(), true);
         assert!(!procs.is_empty(), "the HAL should always have client processes");
         for p in &procs {
             assert!(p.pid > 0, "process object {} reported pid {}", p.object, p.pid);
+            assert!(p.devices.iter().all(|uid| !uid.is_empty()), "{p:?}");
         }
         let p = &procs[0];
         assert_eq!(translate_pid(p.pid), Some(p.object));

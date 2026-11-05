@@ -467,6 +467,7 @@ cargo test -p audiowatch-record -- --ignored         # a take trimmed to a windo
 
 * **Naming an app**: `App::parse` reads a bundle id (`com.algoriddim.djay-iphone-free`, which also matches its helpers' `….helper` ids), a pid, or an executable name (`djay Pro`, case-insensitive).
   * A pid goes through `kAudioHardwarePropertyTranslatePIDToProcessObject`. A pid doesn't survive a restart; a name or bundle id does.
+  * `App::PlayingInto(prefix)` is every process playing into an output device whose UID starts with `prefix` (`kAudioProcessPropertyDevices`). tussen's "everything except tussen" is `AppTap::all_except([App::This, App::PlayingInto("com.simply.audio.tussen.".into())])`: an app playing into Tussen In reaches tussen through that device, so the tap leaves it out, and takes it back when it plays elsewhere. A process playing into a Tussen device and the speakers at once is left out whole. The move is seen on the 500 ms poll.
 * **It follows the app.**
   * Not running: the status is `waiting for djay Pro`.
   * It attaches when the app starts, and makes a new tap when the app restarts and its HAL process object changes.

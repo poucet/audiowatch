@@ -40,6 +40,11 @@
 //! * [`Apps::AllExcept`]: every process except these (leave yourself out,
 //!   [`App::This`], so your own output doesn't feed back).
 //!
+//! [`App::PlayingInto`] names processes by the output device they play
+//! into (a device UID prefix), and is re-read as they move: a program with
+//! its own virtual devices leaves out what already reaches it through them,
+//! so the tap doesn't carry it twice.
+//!
 //! The capture **follows** the apps. While none of them runs it reports
 //! [`AppStatus::Waiting`] ("waiting for djay Pro"); it attaches when one
 //! starts, and makes a new tap when one restarts (a new process is a new

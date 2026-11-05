@@ -26,6 +26,12 @@ pub enum App {
     Pid(i32),
     /// The process calling this crate (for "everything except me").
     This,
+    /// Every process playing into an output device whose UID starts with
+    /// this prefix, followed as processes start and stop playing there.
+    /// In [`Apps::AllExcept`] it keeps a program's own virtual devices out
+    /// of "everything": an app playing into one reaches the program
+    /// through that device, so the tap would carry it twice.
+    PlayingInto(String),
 }
 
 impl App {
@@ -64,7 +70,15 @@ impl App {
             }
             App::Pid(pid) => p.pid == *pid,
             App::This => p.pid == this,
+            App::PlayingInto(prefix) => {
+                p.devices.iter().any(|uid| uid.starts_with(prefix.as_str()))
+            }
         }
+    }
+
+    /// Whether matching this app needs the devices each process plays into.
+    pub(crate) fn needs_devices(&self) -> bool {
+        matches!(self, App::PlayingInto(_))
     }
 }
 
@@ -74,6 +88,7 @@ impl fmt::Display for App {
             App::Bundle(s) | App::Executable(s) => f.write_str(s),
             App::Pid(p) => write!(f, "pid {p}"),
             App::This => f.write_str("this process"),
+            App::PlayingInto(prefix) => write!(f, "whatever plays into {prefix}*"),
         }
     }
 }
@@ -135,6 +150,12 @@ impl AppTap {
 
     fn names(&self) -> String {
         join(self.list().iter().map(App::to_string))
+    }
+
+    /// Whether following this tap needs the devices each process plays
+    /// into (an [`App::PlayingInto`] is listed).
+    pub(crate) fn needs_devices(&self) -> bool {
+        self.list().iter().any(App::needs_devices)
     }
 }
 
@@ -232,6 +253,9 @@ pub(crate) struct Proc {
     pub bundle: Option<String>,
     pub exe: Option<String>,
     pub playing: bool,
+    /// The UIDs of the output devices the process plays into. Read only
+    /// for a tap that lists an [`App::PlayingInto`]; empty otherwise.
+    pub devices: Vec<String>,
 }
 
 /// What the HAL is asked to tap.
@@ -474,8 +498,19 @@ mod tests {
             bundle: (!bundle.is_empty()).then(|| bundle.into()),
             exe: (!exe.is_empty()).then(|| exe.into()),
             playing: true,
+            devices: vec![SPEAKERS.into()],
         }
     }
+
+    /// `p`, now playing into the devices `uids`.
+    fn plays(p: Proc, uids: &[&str]) -> Proc {
+        Proc { devices: uids.iter().map(|u| u.to_string()).collect(), ..p }
+    }
+
+    const SPEAKERS: &str = "BuiltInSpeakerDevice";
+    const TUSSEN: &str = "com.simply.audio.tussen.";
+    const TUSSEN_IN_1: &str = "com.simply.audio.tussen.in.1";
+    const MUSIC: &str = "com.apple.Music";
 
     const DJAY: &str = "com.algoriddim.djay-iphone-free";
     const DJAY_EXE: &str = "/Applications/djay Pro.app/Contents/MacOS/djay Pro";
@@ -506,6 +541,21 @@ mod tests {
         assert!(!App::Executable("djay".into()).matches(&djay, ME));
         assert!(App::Pid(412).matches(&djay, ME));
         assert!(App::This.matches(&proc(1, ME, "", "/x/tussen"), ME));
+    }
+
+    #[test]
+    fn playing_into_matches_a_process_by_the_devices_it_plays_into() {
+        let tussen = App::PlayingInto(TUSSEN.into());
+        let djay = proc(10, 412, DJAY, DJAY_EXE);
+        assert!(!tussen.matches(&djay, ME));
+        assert!(tussen.matches(&plays(djay.clone(), &[TUSSEN_IN_1]), ME));
+        assert!(
+            tussen.matches(&plays(djay.clone(), &[SPEAKERS, "com.simply.audio.tussen.out.1"]), ME)
+        );
+        assert!(!tussen.matches(&plays(djay.clone(), &["com.simply.audio.tussenx.in.1"]), ME));
+        assert!(!tussen.matches(&plays(djay, &[]), ME));
+        assert!(AppTap::all_except([App::This, tussen]).needs_devices());
+        assert!(!AppTap::all_except([App::This]).needs_devices());
     }
 
     #[test]
@@ -677,6 +727,50 @@ mod tests {
         assert!(f.tick(t).is_tapping());
         assert_eq!(fake.0.borrow().opened.last().unwrap().0, Target::AllExcept(vec![12]));
         assert_eq!(fake.0.borrow().live.len(), 1);
+    }
+
+    #[test]
+    fn everything_except_tussen_leaves_out_what_plays_into_a_tussen_device_while_it_does() {
+        let (fake, mut f) =
+            follow(AppTap::all_except([App::This, App::PlayingInto(TUSSEN.into())]));
+        let t = Instant::now();
+        let djay = proc(10, 412, DJAY, DJAY_EXE);
+        let music = proc(3, 5, MUSIC, "/x/Music");
+        let me = plays(proc(12, ME, "", "/x/simply-tussen"), &[TUSSEN_IN_1]);
+        set(&fake, vec![djay.clone(), music.clone(), me.clone()]);
+        assert!(f.tick(t).is_tapping());
+        assert_eq!(fake.0.borrow().opened, [(Target::AllExcept(vec![12]), Mute::Unmuted)]);
+
+        // Music starts playing into Tussen In 1: it reaches tussen through
+        // that device, so the tap is re-made without it.
+        set(&fake, vec![djay.clone(), plays(music.clone(), &[TUSSEN_IN_1]), me.clone()]);
+        assert!(f.tick(t).is_tapping());
+        assert_eq!(fake.0.borrow().opened.last().unwrap().0, Target::AllExcept(vec![3, 12]));
+        assert_eq!((fake.0.borrow().closed.as_slice(), fake.0.borrow().live.len()), (&[1][..], 1));
+        // Nothing else changed: the tap is left alone.
+        f.tick(t);
+        assert_eq!(fake.0.borrow().opened.len(), 2);
+
+        // It goes back to the speakers: in the tap again.
+        set(&fake, vec![djay, music, me]);
+        assert!(f.tick(t).is_tapping());
+        let s = fake.0.borrow();
+        assert_eq!(s.opened.last().unwrap().0, Target::AllExcept(vec![12]));
+        assert_eq!(
+            (s.opened.len(), s.closed.as_slice(), s.live.as_slice()),
+            (3, &[1, 2][..], &[3][..])
+        );
+    }
+
+    #[test]
+    fn only_what_plays_into_a_device_waits_for_a_process_to_play_there() {
+        let (fake, mut f) = follow(AppTap::only([App::PlayingInto(TUSSEN.into())]));
+        let t = Instant::now();
+        set(&fake, vec![proc(10, 412, DJAY, DJAY_EXE)]);
+        assert_eq!(f.tick(t).to_string(), format!("waiting for whatever plays into {TUSSEN}*"));
+        set(&fake, vec![plays(proc(10, 412, DJAY, DJAY_EXE), &[TUSSEN_IN_1])]);
+        assert_eq!(f.tick(t).to_string(), "tapping djay Pro (pid 412) at 48000 Hz");
+        assert_eq!(fake.0.borrow().opened, [(Target::Processes(vec![10]), Mute::Unmuted)]);
     }
 
     #[test]
