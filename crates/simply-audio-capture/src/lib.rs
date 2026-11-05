@@ -65,6 +65,14 @@
 //! # Ok::<(), simply_audio_capture::Error>(())
 //! ```
 //!
+//! # Each app on its own channel
+//!
+//! [`start_app_channels`] takes the same [`AppTap`] but keeps the apps
+//! apart: each process it selects gets a tap of its own, from when it
+//! starts playing until it exits or has been quiet for [`CHANNEL_HOLD`].
+//! An [`AppSinks`] hears each channel start (and hands back its sink) and
+//! stop; [`AppChannels::status`] lists them. See its docs for an example.
+//!
 //! # The sink
 //!
 //! `sink(frames, capture_ns)` gets interleaved `channels`-wide frames at the
@@ -93,6 +101,7 @@
 //! between programs verbatim.
 
 mod apps;
+mod channels;
 // Only the macOS tap drives it; its tests run everywhere.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod default_out;
@@ -100,6 +109,7 @@ mod default_out;
 mod tap;
 
 pub use apps::{App, AppInfo, AppStatus, AppTap, Apps, Mute};
+pub use channels::{AppChannel, AppSinks, ChannelState, ChannelsStatus, CHANNEL_HOLD};
 
 use std::fmt;
 use std::sync::mpsc;
@@ -446,17 +456,9 @@ pub fn start_app<F>(tap: &AppTap, rate: u32, channels: u16, sink: F) -> Result<A
 where
     F: FnMut(&[f32], u64) + Send + 'static,
 {
-    if matches!(&tap.apps, Apps::Only(a) if a.is_empty()) {
-        return Err(Error::new(ErrorKind::NotFound, "an app tap needs at least one app"));
-    }
+    may_tap_apps(tap)?;
     #[cfg(target_os = "macos")]
     {
-        if tap::permission() == Permission::Denied {
-            return Err(Error::new(
-                ErrorKind::PermissionDenied,
-                format!("tapping an app needs System Audio Recording permission, which is denied: {GRANT_HINT}"),
-            ));
-        }
         let following = tap::Following::start(
             tap.clone(),
             rate.max(1),
@@ -468,7 +470,117 @@ where
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (rate, channels, sink);
-        Err(Error::new(ErrorKind::Unsupported, "tapping an app needs macOS 14.2+"))
+        unreachable!("may_tap_apps refuses off macOS")
+    }
+}
+
+/// Why `tap` can't be followed here, if it can't: it names no app,
+/// System Audio Recording is known to be denied, or this isn't macOS.
+fn may_tap_apps(tap: &AppTap) -> Result<(), Error> {
+    if matches!(&tap.apps, Apps::Only(a) if a.is_empty()) {
+        return Err(Error::new(ErrorKind::NotFound, "an app tap needs at least one app"));
+    }
+    #[cfg(target_os = "macos")]
+    if tap::permission() == Permission::Denied {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!("tapping an app needs System Audio Recording permission, which is denied: {GRANT_HINT}"),
+        ));
+    }
+    #[cfg(not(target_os = "macos"))]
+    return Err(Error::new(ErrorKind::Unsupported, "tapping an app needs macOS 14.2+"));
+    #[cfg(target_os = "macos")]
+    Ok(())
+}
+
+/// A running per-app capture (see [`start_app_channels`]). Dropping it
+/// stops it: every channel's tap is destroyed, its sink dropped and
+/// [`AppSinks::stopped`] called, before the drop returns.
+pub struct AppChannels {
+    tap: AppTap,
+    #[cfg(target_os = "macos")]
+    channels: tap::Channels,
+}
+
+impl AppChannels {
+    /// What was asked for.
+    pub fn tap(&self) -> &AppTap {
+        &self.tap
+    }
+
+    /// The channels now, and the apps asked for that aren't running.
+    /// Cheap: read it as often as a UI repaints.
+    pub fn status(&self) -> ChannelsStatus {
+        #[cfg(target_os = "macos")]
+        return self.channels.status();
+        #[cfg(not(target_os = "macos"))]
+        unreachable!("an AppChannels is only made on macOS")
+    }
+}
+
+/// Tap applications as [`start_app`] does, but **each app on its own
+/// channel** rather than one mix: every process `tap` selects gets its own
+/// process tap, from when it starts playing until it exits, leaves the
+/// selection (an [`App::PlayingInto`] it now plays into) or has been quiet
+/// for [`CHANNEL_HOLD`]. `sinks` hears each channel start and stop and
+/// gives each its sink: `channels`-wide frames at `rate`, exactly as
+/// [`start`]'s (see the crate docs).
+///
+/// [`Apps::Only`] gives a channel to each running process of the apps
+/// named; [`Apps::AllExcept`] to every playing process not excluded. A
+/// channel is one process: an app's helper processes (a browser's) are
+/// channels of their own, each telling its bundle id and pid.
+///
+/// Each channel's tap is clocked by the default output when it is made
+/// and runs on its own real-time thread; the sinks' host-clock times are
+/// what lines channels up.
+///
+/// Returns after the first look, with the apps playing now already
+/// started. Fails when System Audio Recording is known to be denied, when
+/// [`Apps::Only`] names nothing, or off macOS; a channel whose tap cannot
+/// be made is reported in its [`ChannelState`] and retried.
+///
+/// ```no_run
+/// use simply_audio_capture::{App, AppInfo, AppSinks, AppTap};
+///
+/// struct Meters;
+/// impl AppSinks for Meters {
+///     type Sink = Box<dyn FnMut(&[f32], u64) + Send>;
+///     fn started(&mut self, app: &AppInfo) -> Self::Sink {
+///         println!("+ {} (pid {})", app.name, app.pid);
+///         Box::new(|frames: &[f32], _ns: u64| {
+///             // this app's interleaved stereo at 48 kHz, on its own audio thread
+///         })
+///     }
+///     fn stopped(&mut self, app: &AppInfo) {
+///         println!("- {} (pid {})", app.name, app.pid);
+///     }
+/// }
+///
+/// let tap = AppTap::all_except([App::This]);
+/// let capture = simply_audio_capture::start_app_channels(&tap, 48_000, 2, Meters)?;
+/// for c in capture.status().channels {
+///     println!("{} {:?}", c.app.name, c.state);
+/// }
+/// # Ok::<(), simply_audio_capture::Error>(())
+/// ```
+pub fn start_app_channels<S: AppSinks>(
+    tap: &AppTap,
+    rate: u32,
+    channels: u16,
+    sinks: S,
+) -> Result<AppChannels, Error> {
+    may_tap_apps(tap)?;
+    #[cfg(target_os = "macos")]
+    {
+        let channels =
+            tap::Channels::start(tap.clone(), rate.max(1), channels.max(1) as usize, sinks)?;
+        Ok(AppChannels { tap: tap.clone(), channels })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (rate, channels, sinks);
+        unreachable!("may_tap_apps refuses off macOS")
     }
 }
 

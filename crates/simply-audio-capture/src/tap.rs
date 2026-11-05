@@ -34,6 +34,7 @@ use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSUUID};
 use crate::apps::{
     self, AppInfo, AppStatus, AppTap, Backend, Follow, Mute, Proc, Stall, Target, STALL,
 };
+use crate::channels::{AppSinks, ChannelsStatus, Split};
 use crate::default_out::{FollowDefault, Now, Outputs};
 use crate::{Error, ErrorKind, Feed, Permission, Sink};
 
@@ -248,86 +249,8 @@ impl OutputTap {
         sink: &mut Option<Sink>,
     ) -> Result<(), Error> {
         let uid = NSString::from_str(&clock.uid);
-        let desc = match kind {
-            Kind::Device(_) => CATapDescription::initExcludingProcesses_andDeviceUID_withStream(
-                CATapDescription::alloc(),
-                &NSArray::<NSNumber>::new(),
-                &uid,
-                0,
-            ),
-            Kind::Processes { target, .. } => {
-                let ids = |objects: &[u32]| {
-                    let n: Vec<_> = objects.iter().map(|o| NSNumber::new_u32(*o)).collect();
-                    NSArray::from_retained_slice(&n)
-                };
-                match target {
-                    Target::Processes(o) => CATapDescription::initStereoMixdownOfProcesses(
-                        CATapDescription::alloc(),
-                        &ids(o),
-                    ),
-                    Target::AllExcept(o) => {
-                        CATapDescription::initStereoGlobalTapButExcludeProcesses(
-                            CATapDescription::alloc(),
-                            &ids(o),
-                        )
-                    }
-                }
-            }
-        };
-        let mute = match kind {
-            Kind::Device(_) | Kind::Processes { mute: Mute::Unmuted, .. } => {
-                CATapMuteBehavior::Unmuted
-            }
-            Kind::Processes { mute: Mute::Muted, .. } => CATapMuteBehavior::Muted,
-            Kind::Processes { mute: Mute::MutedWhenTapped, .. } => {
-                CATapMuteBehavior::MutedWhenTapped
-            }
-        };
-        desc.setName(&NSString::from_str(AGGREGATE_NAME));
-        desc.setMixdown(true);
-        desc.setMono(false);
-        desc.setPrivate(true);
-        desc.setMuteBehavior(mute);
-        check(
-            AudioHardwareCreateProcessTap(Some(&desc), &mut self.tap),
-            "creating the process tap (macOS 14.2+)",
-        )?;
-
-        let tap_uid = desc.UUID().UUIDString();
-
-        let key = |k: &CStr| NSString::from_str(k.to_str().unwrap_or_default());
-        let sub_device = NSDictionary::<NSString, AnyObject>::from_slices(
-            &[&*key(kAudioSubDeviceUIDKey)],
-            &[&*uid as &AnyObject],
-        );
-        let yes = NSNumber::new_bool(true);
-        let sub_tap = NSDictionary::<NSString, AnyObject>::from_slices(
-            &[&*key(kAudioSubTapUIDKey), &*key(kAudioSubTapDriftCompensationKey)],
-            &[&*tap_uid as &AnyObject, &*yes],
-        );
-        let agg_uid =
-            NSString::from_str(&format!("simply-audio-capture-tap-{}", NSUUID::new().UUIDString()));
-        let agg_name = NSString::from_str(AGGREGATE_NAME);
-        let subs = NSArray::from_slice(&[&*sub_device]);
-        let taps = NSArray::from_slice(&[&*sub_tap]);
-        let agg = NSDictionary::<NSString, AnyObject>::from_slices(
-            &[
-                &*key(kAudioAggregateDeviceUIDKey),
-                &*key(kAudioAggregateDeviceNameKey),
-                &*key(kAudioAggregateDeviceMainSubDeviceKey),
-                &*key(kAudioAggregateDeviceIsPrivateKey),
-                &*key(kAudioAggregateDeviceTapAutoStartKey),
-                &*key(kAudioAggregateDeviceSubDeviceListKey),
-                &*key(kAudioAggregateDeviceTapListKey),
-            ],
-            &[&*agg_uid as &AnyObject, &*agg_name, &*uid, &*yes, &*yes, &*subs, &*taps],
-        );
-        // NSDictionary is toll-free bridged to CFDictionary.
-        let cf: &CFDictionary = &*(Retained::as_ptr(&agg) as *const CFDictionary);
-        check(
-            AudioHardwareCreateAggregateDevice(cf, NonNull::from(&mut self.aggregate)),
-            "creating the private aggregate device",
-        )?;
+        let tap_uid = create_tap(kind, &mut self.tap)?;
+        self.aggregate = create_aggregate(&uid, &[&tap_uid])?;
         // The rate the IOProc runs at is the aggregate's, clocked by the
         // tapped device. (The tap's own format property said 48000 for
         // speakers running at 44100 — measured — so it isn't used.)
@@ -391,6 +314,13 @@ impl OutputTap {
     /// Why this tap no longer delivers, if it doesn't: the device it is
     /// clocked by is gone, or the IOProc stopped being called.
     pub(crate) fn health(&self) -> Option<String> {
+        self.health_while(true)
+    }
+
+    /// [`health`](OutputTap::health), for a tap whose processes may not be
+    /// `playing`: a tap of processes that play nothing is not called back
+    /// at all (measured), so then only its clock device is checked.
+    pub(crate) fn health_while(&self, playing: bool) -> Option<String> {
         let alive: Result<u32, _> =
             get(self.clock, kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal);
         if !matches!(alive, Ok(1)) {
@@ -398,6 +328,10 @@ impl OutputTap {
         }
         let calls = self.calls.load(Ordering::Relaxed);
         let mut stall = self.stall.lock().unwrap_or_else(|e| e.into_inner());
+        if !playing {
+            stall.rest(calls, Instant::now());
+            return None;
+        }
         stall.stalled(calls, Instant::now()).then(|| {
             format!("the tap stopped delivering audio (no callback for {} s)", STALL.as_secs())
         })
@@ -416,6 +350,99 @@ impl Drop for OutputTap {
             }
         }
     }
+}
+
+/// Make the process tap `kind` describes (stereo mixdown, private, with
+/// its mute behaviour) into `*tap`, and return its UID. `*tap` is set
+/// before anything can fail after it, so the caller destroys it either way.
+unsafe fn create_tap(kind: &Kind, tap: &mut AudioObjectID) -> Result<Retained<NSString>, Error> {
+    let desc = match kind {
+        Kind::Device(d) => CATapDescription::initExcludingProcesses_andDeviceUID_withStream(
+            CATapDescription::alloc(),
+            &NSArray::<NSNumber>::new(),
+            &NSString::from_str(&d.uid),
+            0,
+        ),
+        Kind::Processes { target, .. } => {
+            let ids = |objects: &[u32]| {
+                let n: Vec<_> = objects.iter().map(|o| NSNumber::new_u32(*o)).collect();
+                NSArray::from_retained_slice(&n)
+            };
+            match target {
+                Target::Processes(o) => CATapDescription::initStereoMixdownOfProcesses(
+                    CATapDescription::alloc(),
+                    &ids(o),
+                ),
+                Target::AllExcept(o) => CATapDescription::initStereoGlobalTapButExcludeProcesses(
+                    CATapDescription::alloc(),
+                    &ids(o),
+                ),
+            }
+        }
+    };
+    let mute = match kind {
+        Kind::Device(_) | Kind::Processes { mute: Mute::Unmuted, .. } => CATapMuteBehavior::Unmuted,
+        Kind::Processes { mute: Mute::Muted, .. } => CATapMuteBehavior::Muted,
+        Kind::Processes { mute: Mute::MutedWhenTapped, .. } => CATapMuteBehavior::MutedWhenTapped,
+    };
+    desc.setName(&NSString::from_str(AGGREGATE_NAME));
+    desc.setMixdown(true);
+    desc.setMono(false);
+    desc.setPrivate(true);
+    desc.setMuteBehavior(mute);
+    check(
+        AudioHardwareCreateProcessTap(Some(&desc), tap),
+        "creating the process tap (macOS 14.2+)",
+    )?;
+    Ok(desc.UUID().UUIDString())
+}
+
+fn key(k: &CStr) -> Retained<NSString> {
+    NSString::from_str(k.to_str().unwrap_or_default())
+}
+
+/// A private aggregate device clocked by (and holding) the device `clock`,
+/// with the taps `taps` (by UID) as its inputs, started automatically.
+unsafe fn create_aggregate(clock: &NSString, taps: &[&NSString]) -> Result<AudioObjectID, Error> {
+    let sub_device = NSDictionary::<NSString, AnyObject>::from_slices(
+        &[&*key(kAudioSubDeviceUIDKey)],
+        &[clock as &AnyObject],
+    );
+    let yes = NSNumber::new_bool(true);
+    let sub_taps: Vec<_> = taps
+        .iter()
+        .map(|uid| {
+            NSDictionary::<NSString, AnyObject>::from_slices(
+                &[&*key(kAudioSubTapUIDKey), &*key(kAudioSubTapDriftCompensationKey)],
+                &[*uid as &AnyObject, &*yes],
+            )
+        })
+        .collect();
+    let agg_uid =
+        NSString::from_str(&format!("simply-audio-capture-tap-{}", NSUUID::new().UUIDString()));
+    let agg_name = NSString::from_str(AGGREGATE_NAME);
+    let subs = NSArray::from_slice(&[&*sub_device]);
+    let taps = NSArray::from_retained_slice(&sub_taps);
+    let agg = NSDictionary::<NSString, AnyObject>::from_slices(
+        &[
+            &*key(kAudioAggregateDeviceUIDKey),
+            &*key(kAudioAggregateDeviceNameKey),
+            &*key(kAudioAggregateDeviceMainSubDeviceKey),
+            &*key(kAudioAggregateDeviceIsPrivateKey),
+            &*key(kAudioAggregateDeviceTapAutoStartKey),
+            &*key(kAudioAggregateDeviceSubDeviceListKey),
+            &*key(kAudioAggregateDeviceTapListKey),
+        ],
+        &[&*agg_uid as &AnyObject, &*agg_name, clock, &*yes, &*yes, &*subs, &*taps],
+    );
+    // NSDictionary is toll-free bridged to CFDictionary.
+    let cf: &CFDictionary = &*(Retained::as_ptr(&agg) as *const CFDictionary);
+    let mut aggregate = 0;
+    check(
+        AudioHardwareCreateAggregateDevice(cf, NonNull::from(&mut aggregate)),
+        "creating the private aggregate device",
+    )?;
+    Ok(aggregate)
 }
 
 /// The real-time callback: the tap's frames, mapped to `channels` wide, into
@@ -616,8 +643,8 @@ impl Backend for Hal {
         tap.into_sink()
     }
 
-    fn health(&mut self, tap: &OutputTap) -> Option<String> {
-        tap.health()
+    fn health(&mut self, tap: &OutputTap, playing: bool) -> Option<String> {
+        tap.health_while(playing)
     }
 }
 
@@ -802,6 +829,39 @@ impl Following {
     }
 
     pub(crate) fn status(&self) -> AppStatus {
+        self.status.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// A running per-app follower: its thread owns the [`Split`], its taps and
+/// the caller's [`AppSinks`].
+pub(crate) struct Channels {
+    status: Arc<Mutex<ChannelsStatus>>,
+    _watcher: Watcher,
+}
+
+impl Channels {
+    /// Start following `tap`, one channel per app, into `sinks`. Returns
+    /// after the first look (the apps playing now have their channels).
+    pub(crate) fn start<S: AppSinks>(
+        tap: AppTap,
+        rate: u32,
+        channels: usize,
+        sinks: S,
+    ) -> Result<Channels, Error> {
+        let status = Arc::new(Mutex::new(ChannelsStatus::default()));
+        let hal = Hal { rate, channels, cache: HashMap::new(), devices: tap.needs_devices() };
+        let mut split = Split::new(hal, tap, std::process::id() as i32, sinks);
+        let shared = Arc::clone(&status);
+        let watcher = Watcher::start("audio app channels", &APPS_WATCHED, move |now| {
+            let s = split.tick(now).clone();
+            *shared.lock().unwrap_or_else(|e| e.into_inner()) = s;
+            Ok(())
+        })?;
+        Ok(Channels { status, _watcher: watcher })
+    }
+
+    pub(crate) fn status(&self) -> ChannelsStatus {
         self.status.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
@@ -1027,6 +1087,263 @@ mod tests {
         assert_eq!(ours(), 1);
         drop(f);
         assert_eq!(ours(), 0);
+    }
+
+    /// A process playing (silence) out of this test, tapped on a channel of
+    /// its own: the channel starts, its sink gets frames, and dropping the
+    /// capture stops it and leaves no aggregate behind. Ignored for the
+    /// same reason as the others.
+    #[test]
+    #[ignore]
+    fn an_app_channel_starts_delivers_and_leaves_no_aggregate_behind() {
+        use crate::channels::{AppSinks, ChannelState};
+        let _serial = REAL_TAP.lock().unwrap_or_else(|e| e.into_inner());
+        let ours = || list_devices().unwrap().iter().filter(|o| o.name == AGGREGATE_NAME).count();
+        let stream = silence();
+        cpal::traits::StreamTrait::play(&stream).unwrap();
+
+        #[derive(Clone, Default)]
+        struct Heard(Arc<Mutex<Vec<String>>>, Arc<AtomicU64>);
+        impl AppSinks for Heard {
+            type Sink = Box<dyn FnMut(&[f32], u64) + Send>;
+            fn started(&mut self, app: &AppInfo) -> Self::Sink {
+                self.0.lock().unwrap().push(format!("+{}", app.pid));
+                let frames = Arc::clone(&self.1);
+                Box::new(move |f: &[f32], _| {
+                    frames.fetch_add(f.len() as u64 / 2, Ordering::Relaxed);
+                })
+            }
+            fn stopped(&mut self, app: &AppInfo) {
+                self.0.lock().unwrap().push(format!("-{}", app.pid));
+            }
+        }
+        let heard = Heard::default();
+        let tap = AppTap::only([crate::App::This]);
+        let c = Channels::start(tap, 48_000, 2, heard.clone()).unwrap();
+        let me = std::process::id();
+        std::thread::sleep(Duration::from_secs(1));
+        let status = c.status();
+        eprintln!("{status:?}");
+        assert_eq!(status.channels.len(), 1);
+        assert!(matches!(status.channels[0].state, ChannelState::Tapping { .. }));
+        assert_eq!(ours(), 1);
+        assert!(heard.1.load(Ordering::Relaxed) > 0, "the channel's sink got no frames");
+        drop(c);
+        assert_eq!(*heard.0.lock().unwrap(), [format!("+{me}"), format!("-{me}")]);
+        assert_eq!(ours(), 0);
+        drop(stream);
+    }
+
+    /// Make this process an audio client of the default output, with a
+    /// stream of silence that plays once started.
+    fn silence() -> cpal::Stream {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        let out = cpal::default_host().default_output_device().unwrap();
+        let config = out.default_output_config().unwrap();
+        out.build_output_stream::<f32, _, _>(
+            config.config(),
+            |data: &mut [f32], _: &cpal::OutputCallbackInfo| data.fill(0.0),
+            |_| {},
+            None,
+        )
+        .unwrap()
+    }
+
+    /// What the per-app capture's choice rests on, measured on this Mac:
+    /// what a one-process tap costs to make and to destroy, how long until
+    /// its first callback, and whether a tap can join or leave an aggregate
+    /// that is already running (and what that does to the audio already
+    /// flowing through it). Prints its findings; asserts only that it
+    /// cleaned up. Ignored like the others; it skips itself while System
+    /// Audio Recording was never asked for, so it never raises the prompt:
+    /// `cargo test -p simply-audio-capture measure_tap_costs -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn measure_tap_costs() {
+        let _serial = REAL_TAP.lock().unwrap_or_else(|e| e.into_inner());
+        let ours = || list_devices().unwrap().iter().filter(|o| o.name == AGGREGATE_NAME).count();
+        let perm = permission();
+        eprintln!("permission: {perm:?}");
+        if perm == Permission::Unknown {
+            eprintln!("skipped: the first tap would raise the permission prompt");
+            return;
+        }
+        let clock = find_output("").unwrap();
+        let one = |object: u32| Kind::Processes {
+            target: Target::Processes(vec![object]),
+            mute: Mute::Unmuted,
+            clock: clock.clone(),
+        };
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        let first_call = |tap: &OutputTap, t0: Instant| {
+            while tap.calls.load(Ordering::Relaxed) == 0 && t0.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            match tap.calls.load(Ordering::Relaxed) {
+                0 => "none in 2 s".to_owned(),
+                _ => format!("{:.1} ms", ms(t0.elapsed())),
+            }
+        };
+        let quiet = || Box::new(|_: &[f32], _: u64| {}) as Sink;
+
+        // A process that is not playing: does its tap call back at all?
+        let procs = list_processes(&mut HashMap::new(), false);
+        for p in procs.iter().filter(|p| !p.playing).take(2) {
+            let t0 = Instant::now();
+            let tap =
+                OutputTap::open(one(p.object), 48_000, 2, quiet()).map_err(|(e, _)| e).unwrap();
+            eprintln!(
+                "tap of pid {:>6} (not playing): open {:.1} ms, first callback {}",
+                p.pid,
+                ms(t0.elapsed()),
+                first_call(&tap, t0)
+            );
+        }
+
+        // This process, made an audio client but silent, then made to play
+        // (silence) while its tap is open: when does the tap start?
+        let stream = silence();
+        let me = translate_pid(std::process::id() as i32).expect("an output stream makes a client");
+        let t0 = Instant::now();
+        let tap = OutputTap::open(one(me), 48_000, 2, quiet()).map_err(|(e, _)| e).unwrap();
+        let opened = t0.elapsed();
+        std::thread::sleep(Duration::from_millis(300));
+        let before = tap.calls.load(Ordering::Relaxed);
+        let t1 = Instant::now();
+        cpal::traits::StreamTrait::play(&stream).unwrap();
+        eprintln!(
+            "tap of this process: open {:.1} ms, {before} callbacks while silent, first callback {} after it starts playing",
+            ms(opened),
+            first_call(&tap, t1)
+        );
+        drop(tap);
+
+        // A playing process: make, first callback, destroy, five times.
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            let tap = OutputTap::open(one(me), 48_000, 2, quiet()).map_err(|(e, _)| e).unwrap();
+            let opened = t0.elapsed();
+            let first = first_call(&tap, t0);
+            let t1 = Instant::now();
+            drop(tap);
+            eprintln!(
+                "tap of this process (playing): open {:6.1} ms, first callback {first}, close {:6.1} ms",
+                ms(opened),
+                ms(t1.elapsed())
+            );
+        }
+        assert_eq!(ours(), 0);
+
+        // One aggregate, taps added and removed while it runs.
+        let other = procs.iter().find(|p| p.object != me).expect("coreaudiod has other clients");
+        unsafe {
+            let (mut a, mut b) = (0, 0);
+            let uid_a = create_tap(&one(me), &mut a).unwrap();
+            let uid_b = create_tap(&one(other.object), &mut b).unwrap();
+            let clock_uid = NSString::from_str(&clock.uid);
+            let agg = create_aggregate(&clock_uid, &[&uid_a]).unwrap();
+            let probe = Box::into_raw(Box::new(Probe::default()));
+            let mut proc_id: AudioDeviceIOProcID = None;
+            check(
+                AudioDeviceCreateIOProcID(
+                    agg,
+                    Some(probe_proc),
+                    probe.cast(),
+                    NonNull::from(&mut proc_id),
+                ),
+                "probe IOProc",
+            )
+            .unwrap();
+            check(AudioDeviceStart(agg, proc_id), "starting the probe").unwrap();
+            let settle = || std::thread::sleep(Duration::from_millis(400));
+            let report = |what: &str| {
+                let p = &*probe;
+                let gap = p.max_gap.swap(0, Ordering::Relaxed) as f64 / 1e6;
+                let streams = get_vec::<AudioObjectID>(
+                    agg,
+                    kAudioDevicePropertyStreams,
+                    kAudioObjectPropertyScopeInput,
+                )
+                .unwrap_or_default()
+                .len();
+                eprintln!(
+                    "{what}: {} callbacks, {} buffers in the last, {streams} input streams, \
+                     longest gap between callbacks {gap:.1} ms",
+                    p.calls.load(Ordering::Relaxed),
+                    p.buffers.load(Ordering::Relaxed),
+                );
+            };
+            let set_taps = |uids: &[&NSString]| {
+                let list = NSArray::from_slice(uids);
+                let ptr = Retained::as_ptr(&list);
+                let addr =
+                    address(kAudioAggregateDevicePropertyTapList, kAudioObjectPropertyScopeGlobal);
+                let t = Instant::now();
+                let status = AudioObjectSetPropertyData(
+                    agg,
+                    NonNull::from(&addr),
+                    0,
+                    std::ptr::null(),
+                    std::mem::size_of_val(&ptr) as u32,
+                    NonNull::from(&ptr).cast(),
+                );
+                (status, t.elapsed())
+            };
+            settle();
+            report("aggregate with tap A");
+            let (status, took) = set_taps(&[&uid_a, &uid_b]);
+            eprintln!(
+                "adding tap B to the running aggregate: OSStatus {status}, {:.1} ms",
+                ms(took)
+            );
+            settle();
+            report("after adding B");
+            let (status, took) = set_taps(&[&uid_a]);
+            eprintln!("removing tap B: OSStatus {status}, {:.1} ms", ms(took));
+            settle();
+            report("after removing B");
+
+            AudioDeviceStop(agg, proc_id);
+            AudioDeviceDestroyIOProcID(agg, proc_id);
+            drop(Box::from_raw(probe));
+            AudioHardwareDestroyAggregateDevice(agg);
+            AudioHardwareDestroyProcessTap(a);
+            AudioHardwareDestroyProcessTap(b);
+        }
+        drop(stream);
+        assert_eq!(ours(), 0);
+    }
+
+    /// What the measuring IOProc counts.
+    #[derive(Default)]
+    struct Probe {
+        calls: AtomicU64,
+        buffers: AtomicU64,
+        /// Host time of the last callback, and the longest gap seen (ns).
+        last: AtomicU64,
+        max_gap: AtomicU64,
+    }
+
+    unsafe extern "C-unwind" fn probe_proc(
+        _device: AudioObjectID,
+        now: NonNull<AudioTimeStamp>,
+        input: NonNull<AudioBufferList>,
+        _input_time: NonNull<AudioTimeStamp>,
+        _output: NonNull<AudioBufferList>,
+        _output_time: NonNull<AudioTimeStamp>,
+        client: *mut c_void,
+    ) -> OSStatus {
+        let p = &*(client as *const Probe);
+        p.calls.fetch_add(1, Ordering::Relaxed);
+        p.buffers.store((*input.as_ptr()).mNumberBuffers as u64, Ordering::Relaxed);
+        let mut tb = MachTimebaseInfo { numer: 1, denom: 1 };
+        mach_timebase_info(&mut tb);
+        let ns = now.as_ref().mHostTime as u128 * tb.numer as u128 / tb.denom.max(1) as u128;
+        let last = p.last.swap(ns as u64, Ordering::Relaxed);
+        if last != 0 {
+            p.max_gap.fetch_max((ns as u64).saturating_sub(last), Ordering::Relaxed);
+        }
+        0
     }
 
     /// Creates a real tap on the default output and destroys it: the private

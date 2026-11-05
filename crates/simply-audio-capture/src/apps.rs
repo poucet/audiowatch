@@ -142,13 +142,13 @@ impl AppTap {
         AppTap { mute, ..self }
     }
 
-    fn list(&self) -> &[App] {
+    pub(crate) fn list(&self) -> &[App] {
         match &self.apps {
             Apps::Only(a) | Apps::AllExcept(a) => a,
         }
     }
 
-    fn names(&self) -> String {
+    pub(crate) fn names(&self) -> String {
         join(self.list().iter().map(App::to_string))
     }
 
@@ -286,8 +286,10 @@ pub(crate) trait Backend {
     /// Stop and destroy a tap; its sink comes back.
     fn close(&mut self, tap: Self::Tap) -> Sink;
     /// Why a running tap is no longer good (its clock device vanished, it
-    /// stopped calling back), if it isn't.
-    fn health(&mut self, tap: &Self::Tap) -> Option<String>;
+    /// stopped calling back), if it isn't. A tap of processes none of which
+    /// is `playing` is not called back at all (measured), so its silence is
+    /// not a stall.
+    fn health(&mut self, tap: &Self::Tap, playing: bool) -> Option<String>;
 }
 
 /// How long a failed tap waits before it is tried again.
@@ -327,7 +329,7 @@ impl<B: Backend> Follow<B> {
     /// Look at the HAL and bring the tap in line with it.
     pub(crate) fn tick(&mut self, now: Instant) -> &AppStatus {
         let procs = self.backend.processes();
-        let (matched, missing) = self.resolve(&procs);
+        let (matched, missing) = resolve(&mut self.backend, &self.tap, self.this, &procs);
         let mut key: Vec<u32> = matched.iter().map(|p| p.object).collect();
         key.sort_unstable();
         key.dedup();
@@ -342,7 +344,7 @@ impl<B: Backend> Follow<B> {
             _ => None,
         };
         if let Some(open) = &self.open {
-            let problem = self.backend.health(&open.tap);
+            let problem = self.backend.health(&open.tap, true);
             if problem.is_none() && want && open.key == key {
                 if let AppStatus::Tapping { missing: m, .. } = &mut self.status {
                     *m = missing;
@@ -385,42 +387,6 @@ impl<B: Backend> Follow<B> {
         &self.status
     }
 
-    /// The processes the tap names, and the apps asked for that aren't
-    /// running.
-    fn resolve(&mut self, procs: &[Proc]) -> (Vec<Proc>, Vec<String>) {
-        let mut matched: Vec<Proc> = Vec::new();
-        let mut missing = Vec::new();
-        for app in self.tap.list().to_vec() {
-            let found: Vec<Proc> = match app {
-                // A pid goes through the HAL's own translation; the listed
-                // process carries the identity, when it is listed.
-                App::Pid(pid) => self.by_pid(pid, procs),
-                App::This => self.by_pid(self.this, procs),
-                _ => procs.iter().filter(|p| app.matches(p, self.this)).cloned().collect(),
-            };
-            if found.is_empty() {
-                missing.push(app.to_string());
-            }
-            for p in found {
-                if !matched.iter().any(|m| m.object == p.object) {
-                    matched.push(p);
-                }
-            }
-        }
-        (matched, missing)
-    }
-
-    fn by_pid(&mut self, pid: i32, procs: &[Proc]) -> Vec<Proc> {
-        match self.backend.translate(pid) {
-            Some(object) => vec![procs
-                .iter()
-                .find(|p| p.object == object)
-                .cloned()
-                .unwrap_or(Proc { object, pid, ..Proc::default() })],
-            None => Vec::new(),
-        }
-    }
-
     /// Stop the tap, if one runs; the sink is dropped with the follower.
     pub(crate) fn stop(&mut self) {
         if let Some(open) = self.open.take() {
@@ -435,7 +401,47 @@ impl<B: Backend> Drop for Follow<B> {
     }
 }
 
-fn describe(procs: &[AppInfo]) -> String {
+/// The processes `tap` names, and the apps it asks for that aren't running.
+pub(crate) fn resolve<B: Backend>(
+    backend: &mut B,
+    tap: &AppTap,
+    this: i32,
+    procs: &[Proc],
+) -> (Vec<Proc>, Vec<String>) {
+    let mut matched: Vec<Proc> = Vec::new();
+    let mut missing = Vec::new();
+    for app in tap.list() {
+        let found: Vec<Proc> = match app {
+            // A pid goes through the HAL's own translation; the listed
+            // process carries the identity, when it is listed.
+            App::Pid(pid) => by_pid(backend, *pid, procs),
+            App::This => by_pid(backend, this, procs),
+            _ => procs.iter().filter(|p| app.matches(p, this)).cloned().collect(),
+        };
+        if found.is_empty() {
+            missing.push(app.to_string());
+        }
+        for p in found {
+            if !matched.iter().any(|m| m.object == p.object) {
+                matched.push(p);
+            }
+        }
+    }
+    (matched, missing)
+}
+
+fn by_pid<B: Backend>(backend: &mut B, pid: i32, procs: &[Proc]) -> Vec<Proc> {
+    match backend.translate(pid) {
+        Some(object) => vec![procs.iter().find(|p| p.object == object).cloned().unwrap_or(Proc {
+            object,
+            pid,
+            ..Proc::default()
+        })],
+        None => Vec::new(),
+    }
+}
+
+pub(crate) fn describe(procs: &[AppInfo]) -> String {
     join(procs.iter().map(|p| format!("{} (pid {})", p.name, p.pid)))
 }
 
@@ -482,16 +488,21 @@ impl Stall {
         }
         now.duration_since(self.since) >= STALL
     }
+
+    /// Nothing is expected to call back now: start the count over.
+    pub(crate) fn rest(&mut self, count: u64, now: Instant) {
+        *self = Stall { count, since: now };
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ErrorKind;
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    fn proc(object: u32, pid: i32, bundle: &str, exe: &str) -> Proc {
+    pub(crate) fn proc(object: u32, pid: i32, bundle: &str, exe: &str) -> Proc {
         Proc {
             object,
             pid,
@@ -503,18 +514,18 @@ mod tests {
     }
 
     /// `p`, now playing into the devices `uids`.
-    fn plays(p: Proc, uids: &[&str]) -> Proc {
+    pub(crate) fn plays(p: Proc, uids: &[&str]) -> Proc {
         Proc { devices: uids.iter().map(|u| u.to_string()).collect(), ..p }
     }
 
-    const SPEAKERS: &str = "BuiltInSpeakerDevice";
-    const TUSSEN: &str = "com.simply.audio.tussen.";
-    const TUSSEN_IN_1: &str = "com.simply.audio.tussen.in.1";
-    const MUSIC: &str = "com.apple.Music";
+    pub(crate) const SPEAKERS: &str = "BuiltInSpeakerDevice";
+    pub(crate) const TUSSEN: &str = "com.simply.audio.tussen.";
+    pub(crate) const TUSSEN_IN_1: &str = "com.simply.audio.tussen.in.1";
+    pub(crate) const MUSIC: &str = "com.apple.Music";
 
-    const DJAY: &str = "com.algoriddim.djay-iphone-free";
-    const DJAY_EXE: &str = "/Applications/djay Pro.app/Contents/MacOS/djay Pro";
-    const ME: i32 = 900;
+    pub(crate) const DJAY: &str = "com.algoriddim.djay-iphone-free";
+    pub(crate) const DJAY_EXE: &str = "/Applications/djay Pro.app/Contents/MacOS/djay Pro";
+    pub(crate) const ME: i32 = 900;
 
     #[test]
     fn parse_tells_bundle_ids_executables_and_pids_apart() {
@@ -579,20 +590,22 @@ mod tests {
 
     /// What the fake HAL has been asked to do.
     #[derive(Default)]
-    struct Script {
-        procs: Vec<Proc>,
+    pub(crate) struct Script {
+        pub(crate) procs: Vec<Proc>,
         /// Next open fails with this.
-        fail: Option<String>,
+        pub(crate) fail: Option<String>,
         /// A tap's health problem, by tap id.
-        sick: Option<String>,
-        opened: Vec<(Target, Mute)>,
-        closed: Vec<u32>,
-        next: u32,
-        live: Vec<u32>,
+        pub(crate) sick: Option<String>,
+        pub(crate) opened: Vec<(Target, Mute)>,
+        pub(crate) closed: Vec<u32>,
+        pub(crate) next: u32,
+        pub(crate) live: Vec<u32>,
+        /// What each health check was told: whether the tapped play.
+        pub(crate) checked: Vec<bool>,
     }
 
     #[derive(Clone, Default)]
-    struct Fake(Rc<RefCell<Script>>);
+    pub(crate) struct Fake(pub(crate) Rc<RefCell<Script>>);
 
     impl Backend for Fake {
         type Tap = (u32, Sink);
@@ -613,6 +626,9 @@ mod tests {
                 return Err((Error::new(ErrorKind::Device, e), sink));
             }
             s.opened.push((target.clone(), mute));
+            // One stereo frame, so a test can tell which sink a tap feeds.
+            let mut sink = sink;
+            sink(&[0.0, 0.0], 0);
             s.next += 1;
             let id = s.next;
             s.live.push(id);
@@ -624,8 +640,10 @@ mod tests {
             s.live.retain(|l| *l != id);
             sink
         }
-        fn health(&mut self, _: &Self::Tap) -> Option<String> {
-            self.0.borrow_mut().sick.take()
+        fn health(&mut self, _: &Self::Tap, playing: bool) -> Option<String> {
+            let mut s = self.0.borrow_mut();
+            s.checked.push(playing);
+            s.sick.take()
         }
     }
 
@@ -635,7 +653,7 @@ mod tests {
         (fake, f)
     }
 
-    fn set(fake: &Fake, procs: Vec<Proc>) {
+    pub(crate) fn set(fake: &Fake, procs: Vec<Proc>) {
         fake.0.borrow_mut().procs = procs;
     }
 
@@ -826,5 +844,8 @@ mod tests {
         assert!(!s.stalled(9, t + STALL));
         assert!(!s.stalled(9, t + STALL + STALL / 2));
         assert!(s.stalled(9, t + STALL * 2));
+        s.rest(9, t + STALL * 3);
+        assert!(!s.stalled(9, t + STALL * 3 + STALL / 2));
+        assert!(s.stalled(9, t + STALL * 4));
     }
 }

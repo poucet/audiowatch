@@ -476,7 +476,7 @@ cargo test -p audiowatch-record -- --ignored         # a take trimmed to a windo
 * **`Mute`**: `Unmuted` (the default: the room still hears it), `Muted` (captured silently), `MutedWhenTapped`.
 * **Clock**: the tap runs in a private aggregate clocked by the default output at the moment it is made, at that device's rate, resampled to the rate asked for. Same sink, same host-clock timestamps as a device capture.
 * **`list_apps()`**: every audio client that plays or can play, playing ones first, with pid, bundle id and executable. `AppInfo::app()` is what to tap it by. Needs no permission.
-* **Limits**: the apps are mixed into one stereo stream, so this is still not the watcher's per-process attribution. An app whose audio is played by a process with another bundle id (Safari's `com.apple.WebKit.GPU`) needs that process named too.
+* **Limits**: the apps are mixed into one stereo stream (for one stream per app, see [Each app on its own channel](#each-app-on-its-own-channel)), so this is still not the watcher's per-process attribution. An app whose audio is played by a process with another bundle id (Safari's `com.apple.WebKit.GPU`) needs that process named too.
 
 Check one by hand (the first run may raise the System Audio Recording prompt):
 
@@ -486,4 +486,44 @@ cargo run -p simply-audio-capture --example app_tap -- com.algoriddim.djay-iphon
 cargo run -p simply-audio-capture --example app_tap -- --mute com.algoriddim.djay-iphone-free
 cargo run -p simply-audio-capture --example app_tap -- --except                        # everything but itself
 cargo test -p simply-audio-capture -- --ignored                                        # a real tap leaves no aggregate behind
+```
+
+### Each app on its own channel
+
+`simply_audio_capture::start_app_channels` takes the same `AppTap` as `start_app`, but gives **each app its own channel** instead of one mix, so a caller can meter and mix the apps apart. `start_app` is unchanged.
+
+```rust
+pub trait AppSinks: Send + 'static {
+    type Sink: FnMut(&[f32], u64) + Send + 'static;
+    fn started(&mut self, app: &AppInfo) -> Self::Sink; // a channel begins: its sink
+    fn stopped(&mut self, app: &AppInfo);               // it ended: its sink is already dropped
+}
+pub fn start_app_channels<S: AppSinks>(tap: &AppTap, rate: u32, channels: u16, sinks: S)
+    -> Result<AppChannels, Error>;
+impl AppChannels { pub fn tap(&self) -> &AppTap; pub fn status(&self) -> ChannelsStatus; }
+pub struct ChannelsStatus { pub channels: Vec<AppChannel>, pub missing: Vec<String> }
+pub struct AppChannel { pub app: AppInfo, pub state: ChannelState }
+pub enum ChannelState { Tapping { device_rate: u32 }, Failed { error: String } }
+pub const CHANNEL_HOLD: Duration; // 5 s
+```
+
+* **A channel is one process**, keyed by `app.pid`. `only` gives one to each running process of the apps named; `all_except` to every playing process not excluded. A browser's helper processes are channels of their own, each with its bundle id. A restarted app is a new process, so a new channel.
+* **When**: a channel starts when its process starts playing (`kAudioProcessPropertyIsRunningOutput`, seen within the 500 ms poll), and stops when the process exits, leaves the selection (an `App::PlayingInto` device it now plays into), or has not played for `CHANNEL_HOLD`. `started` and `stopped` run on the capture's follower thread; each sink runs on its channel's own real-time thread, with `start`'s sink contract.
+* **A failed tap keeps its channel**: its `ChannelState` is `Failed` and it is retried every 3 s; a tap that goes bad is re-made into the same sink, with no `stopped`/`started`.
+* **Mechanism: one private aggregate per app**, each holding a one-process tap (`CATapDescription` of a single process object) and clocked by the default output when it is made. The alternative, one aggregate holding a sub-tap per app, would deliver every app in one callback on one clock, but adding or removing a tap there interrupts every app already in it. Measured on a MacBook Pro (`measure_tap_costs`, below):
+
+  | | one aggregate per app | one shared aggregate |
+  |---|---|---|
+  | add an app | 35–65 ms of HAL calls on the follower thread; first frames 60–110 ms later | setting `kAudioAggregateDevicePropertyTapList` on the running aggregate works (2–12 ms), but the apps already in it lose 30–36 ms of callbacks (about 3 buffers) |
+  | remove an app | 6–13 ms | 2 ms, and again a 30 ms gap for the others |
+  | an app that isn't playing | its tap is never called back: no audio-thread cost | the same |
+
+  The channels' host-clock timestamps line them up. Each per-app tap is clocked by the same device, so they share a rate.
+
+Check one by hand:
+
+```sh
+cargo run -p simply-audio-capture --example app_channels                     # every app but this, one line each
+cargo run -p simply-audio-capture --example app_channels -- Music Spotify    # these apps only
+cargo test -p simply-audio-capture -- --ignored --nocapture --test-threads=1 # incl. a channel of this test process, and the measurements
 ```
