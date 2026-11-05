@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
-use crate::apps::{self, AppInfo, AppTap, Apps, Backend, Proc, Target, RETRY};
+use crate::apps::{self, AppInfo, AppTap, Backend, Proc, Target, RETRY};
 use crate::Sink;
 
 /// Where each app's frames go, and what hears an app come and go.
@@ -118,19 +118,13 @@ impl<B: Backend, S: AppSinks> Split<B, S> {
     pub(crate) fn tick(&mut self, now: Instant) -> &ChannelsStatus {
         let procs = self.backend.processes();
         let (matched, missing) = apps::resolve(&mut self.backend, &self.tap, self.this, &procs);
-        let candidates: Vec<Proc> = match self.tap.apps {
-            Apps::Only(_) => matched,
-            Apps::AllExcept(_) => procs
-                .into_iter()
-                .filter(|p| !matched.iter().any(|m| m.object == p.object))
-                .collect(),
-        };
+        let candidates: Vec<&Proc> = apps::tapped(&self.tap.apps, &procs, &matched);
         self.played.retain(|o, _| candidates.iter().any(|p| p.object == *o));
         for p in candidates.iter().filter(|p| p.playing) {
             self.played.insert(p.object, now);
         }
         let wanted: BTreeMap<u32, &Proc> = candidates
-            .iter()
+            .into_iter()
             .filter(|p| {
                 self.played
                     .get(&p.object)

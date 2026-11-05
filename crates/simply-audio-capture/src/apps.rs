@@ -344,7 +344,10 @@ impl<B: Backend> Follow<B> {
             _ => None,
         };
         if let Some(open) = &self.open {
-            let problem = self.backend.health(&open.tap, true);
+            // A paused app's tap is not called back: that silence is not
+            // a stall, so it is not re-made for it.
+            let playing = tapped(&self.tap.apps, &procs, &matched).iter().any(|p| p.playing);
+            let problem = self.backend.health(&open.tap, playing);
             if problem.is_none() && want && open.key == key {
                 if let AppStatus::Tapping { missing: m, .. } = &mut self.status {
                     *m = missing;
@@ -428,6 +431,17 @@ pub(crate) fn resolve<B: Backend>(
         }
     }
     (matched, missing)
+}
+
+/// The processes a tap takes in, given what [`resolve`] matched: the
+/// matched ones for [`Apps::Only`], every other one for [`Apps::AllExcept`].
+pub(crate) fn tapped<'a>(apps: &Apps, procs: &'a [Proc], matched: &'a [Proc]) -> Vec<&'a Proc> {
+    match apps {
+        Apps::Only(_) => matched.iter().collect(),
+        Apps::AllExcept(_) => {
+            procs.iter().filter(|p| !matched.iter().any(|m| m.object == p.object)).collect()
+        }
+    }
 }
 
 fn by_pid<B: Backend>(backend: &mut B, pid: i32, procs: &[Proc]) -> Vec<Proc> {
@@ -602,6 +616,9 @@ pub(crate) mod tests {
         pub(crate) live: Vec<u32>,
         /// What each health check was told: whether the tapped play.
         pub(crate) checked: Vec<bool>,
+        /// The taps get no callbacks, as a real tap of processes that
+        /// play nothing doesn't: a stall, unless the check is told so.
+        pub(crate) silent: bool,
     }
 
     #[derive(Clone, Default)]
@@ -643,7 +660,8 @@ pub(crate) mod tests {
         fn health(&mut self, _: &Self::Tap, playing: bool) -> Option<String> {
             let mut s = self.0.borrow_mut();
             s.checked.push(playing);
-            s.sick.take()
+            let stall = (s.silent && playing).then(|| "the tap stopped delivering audio".into());
+            s.sick.take().or(stall)
         }
     }
 
@@ -814,6 +832,46 @@ pub(crate) mod tests {
         assert!(f.tick(t).is_tapping());
         let s = fake.0.borrow();
         assert_eq!((s.closed.as_slice(), s.live.as_slice()), (&[1][..], &[2][..]));
+    }
+
+    #[test]
+    fn a_paused_app_s_silent_tap_is_kept_not_re_made() {
+        let (fake, mut f) = follow(AppTap::only([App::parse(DJAY), App::parse("Spotify")]));
+        let t = Instant::now();
+        let spotify = proc(4, 77, "com.spotify.client", "/x/Spotify");
+        let quiet = |p: Proc| Proc { playing: false, ..p };
+        set(&fake, vec![proc(10, 412, DJAY, DJAY_EXE), spotify.clone()]);
+        assert!(f.tick(t).is_tapping());
+        // Both paused: the tap gets no callbacks, and that is no stall.
+        set(&fake, vec![quiet(proc(10, 412, DJAY, DJAY_EXE)), quiet(spotify.clone())]);
+        fake.0.borrow_mut().silent = true;
+        for i in 1..=5 {
+            assert!(f.tick(t + STALL * i).is_tapping());
+        }
+        assert_eq!(fake.0.borrow().checked, [false; 5]);
+        assert_eq!((fake.0.borrow().opened.len(), fake.0.borrow().closed.len()), (1, 0));
+        // One plays again and its tap still says nothing: now it is a stall.
+        set(&fake, vec![quiet(proc(10, 412, DJAY, DJAY_EXE)), spotify]);
+        assert!(f.tick(t + STALL * 6).is_tapping());
+        let s = fake.0.borrow();
+        assert_eq!(
+            (s.checked.last(), s.opened.len(), s.closed.as_slice()),
+            (Some(&true), 2, &[1][..])
+        );
+    }
+
+    #[test]
+    fn everything_except_keeps_its_silent_tap_while_nothing_else_plays() {
+        let (fake, mut f) = follow(AppTap::all_except([App::This]));
+        let t = Instant::now();
+        let me = proc(12, ME, "", "/x/simply-tussen");
+        set(&fake, vec![Proc { playing: false, ..proc(10, 412, DJAY, DJAY_EXE) }, me]);
+        fake.0.borrow_mut().silent = true;
+        for i in 0..5 {
+            assert!(f.tick(t + STALL * i).is_tapping());
+        }
+        let s = fake.0.borrow();
+        assert_eq!((s.opened.len(), s.closed.len(), s.checked.as_slice()), (1, 0, &[false; 4][..]));
     }
 
     #[test]

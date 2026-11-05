@@ -1089,6 +1089,38 @@ mod tests {
         assert_eq!(ours(), 0);
     }
 
+    /// An app tap of this test process while it is an audio client that
+    /// plays nothing: its tap gets no callbacks, and must be kept rather
+    /// than re-made every [`STALL`] as a stalled one would be. The
+    /// aggregate's object id staying the same is what shows it was not.
+    /// Ignored for the same reason as the others.
+    #[test]
+    #[ignore]
+    fn a_paused_app_s_tap_is_kept_not_re_made() {
+        let _serial = REAL_TAP.lock().unwrap_or_else(|e| e.into_inner());
+        let ours = || -> Vec<AudioObjectID> {
+            list_devices()
+                .unwrap()
+                .iter()
+                .filter(|o| o.name == AGGREGATE_NAME)
+                .map(|o| o.id)
+                .collect()
+        };
+        let stream = silence(); // a client, never started
+        let tap = AppTap::only([crate::App::This]);
+        let f = Following::start(tap, 48_000, 2, Box::new(|_: &[f32], _: u64| {})).unwrap();
+        eprintln!("{}", f.status());
+        assert!(f.status().is_tapping());
+        let first = ours();
+        assert_eq!(first.len(), 1);
+        std::thread::sleep(STALL * 2 + POLL * 2);
+        assert!(f.status().is_tapping(), "{}", f.status());
+        assert_eq!(ours(), first, "the paused app's tap was re-made");
+        drop(f);
+        assert!(ours().is_empty());
+        drop(stream);
+    }
+
     /// A process playing (silence) out of this test, tapped on a channel of
     /// its own: the channel starts, its sink gets frames, and dropping the
     /// capture stops it and leaves no aggregate behind. Ignored for the

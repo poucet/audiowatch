@@ -472,7 +472,7 @@ cargo test -p audiowatch-record -- --ignored         # a take trimmed to a windo
   * Not running: the status is `waiting for djay Pro`.
   * It attaches when the app starts, and makes a new tap when the app restarts and its HAL process object changes.
   * It wakes on the HAL's process-list notification, with a 500 ms poll as the backstop, as the watcher does.
-* **It reports, never goes silent.** `AppCapture::status()` and `error()` say when the tapped app exited, the tap could not be made (retried every 3 s), the device it is clocked by disappeared, or the tap stopped calling back for 2 s. The device tap's `Capture::error()` now reports the last two as well.
+* **It reports, never goes silent.** `AppCapture::status()` and `error()` say when the tapped app exited, the tap could not be made (retried every 3 s), the device it is clocked by disappeared, or the tap stopped calling back for 2 s. A tap of apps that are all paused gets no callbacks at all, so that is not a stall and the tap is kept. The device tap's `Capture::error()` now reports the last two as well.
 * **`Mute`**: `Unmuted` (the default: the room still hears it), `Muted` (captured silently), `MutedWhenTapped`.
 * **Clock**: the tap runs in a private aggregate clocked by the default output at the moment it is made, at that device's rate, resampled to the rate asked for. Same sink, same host-clock timestamps as a device capture.
 * **`list_apps()`**: every audio client that plays or can play, playing ones first, with pid, bundle id and executable. `AppInfo::app()` is what to tap it by. Needs no permission.
