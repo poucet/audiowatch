@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::ffi::{c_void, CStr};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -27,7 +27,7 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::AnyThread;
 use objc2_core_audio::*;
-use objc2_core_audio_types::{AudioBufferList, AudioTimeStamp, AudioTimeStampFlags};
+use objc2_core_audio_types::{AudioBuffer, AudioBufferList, AudioTimeStamp, AudioTimeStampFlags};
 use objc2_core_foundation::CFDictionary;
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSUUID};
 
@@ -36,6 +36,7 @@ use crate::apps::{
 };
 use crate::channels::{AppSinks, ChannelsStatus, Split};
 use crate::default_out::{FollowDefault, Now, Outputs};
+use crate::watch::{self, Listen, Listened, Wake};
 use crate::{Error, ErrorKind, Feed, Permission, Sink};
 
 type OSStatus = i32;
@@ -151,21 +152,25 @@ struct Ctx {
     denom: u64,
     /// IOProc calls so far: a count that stands still is a stalled tap.
     calls: Arc<AtomicU64>,
+    /// How many taps the aggregate holds: its last this many input
+    /// streams, summed.
+    taps: usize,
 }
 
 /// What a tap takes in.
 pub(crate) enum Kind {
     /// Every process playing on this output device.
     Device(Device),
-    /// The processes [`Target`] names, wherever they play, clocked by
-    /// `clock` (the default output when the tap was made).
-    Processes { target: Target, mute: Mute, clock: Device },
+    /// The processes the [`Target`]s name (wherever they play, or on one
+    /// device), mixed, clocked by `clock` (the default output when the tap
+    /// was made).
+    Processes { targets: Vec<Target>, mute: Mute, clock: Device },
 }
 
 /// A running tap. Dropping it stops the IOProc and destroys the private
 /// aggregate device and the tap, in that order.
 pub(crate) struct OutputTap {
-    tap: AudioObjectID,
+    taps: Vec<AudioObjectID>,
     aggregate: AudioObjectID,
     proc_id: AudioDeviceIOProcID,
     ctx: *mut Ctx,
@@ -218,7 +223,7 @@ impl OutputTap {
             Kind::Device(d) | Kind::Processes { clock: d, .. } => d.clone(),
         };
         let mut t = OutputTap {
-            tap: 0,
+            taps: Vec::new(),
             aggregate: 0,
             proc_id: None,
             ctx: std::ptr::null_mut(),
@@ -249,8 +254,12 @@ impl OutputTap {
         sink: &mut Option<Sink>,
     ) -> Result<(), Error> {
         let uid = NSString::from_str(&clock.uid);
-        let tap_uid = create_tap(kind, &mut self.tap)?;
-        self.aggregate = create_aggregate(&uid, &[&tap_uid])?;
+        let mut tap_uids = Vec::new();
+        for desc in descriptions(kind)? {
+            tap_uids.push(create_tap(&desc, &mut self.taps)?);
+        }
+        let refs: Vec<&NSString> = tap_uids.iter().map(|u| &**u).collect();
+        self.aggregate = create_aggregate(&uid, &refs)?;
         // The rate the IOProc runs at is the aggregate's, clocked by the
         // tapped device. (The tap's own format property said 48000 for
         // speakers running at 44100 — measured — so it isn't used.)
@@ -275,6 +284,7 @@ impl OutputTap {
             numer: tb.numer as u64,
             denom: tb.denom as u64,
             calls: Arc::clone(&self.calls),
+            taps: refs.len(),
         }));
         check(
             AudioDeviceCreateIOProcID(
@@ -345,55 +355,121 @@ impl Drop for OutputTap {
             if self.aggregate != 0 {
                 AudioHardwareDestroyAggregateDevice(self.aggregate);
             }
-            if self.tap != 0 {
-                AudioHardwareDestroyProcessTap(self.tap);
+            for &tap in &self.taps {
+                AudioHardwareDestroyProcessTap(tap);
             }
         }
     }
 }
 
-/// Make the process tap `kind` describes (stereo mixdown, private, with
-/// its mute behaviour) into `*tap`, and return its UID. `*tap` is set
-/// before anything can fail after it, so the caller destroys it either way.
-unsafe fn create_tap(kind: &Kind, tap: &mut AudioObjectID) -> Result<Retained<NSString>, Error> {
-    let desc = match kind {
-        Kind::Device(d) => CATapDescription::initExcludingProcesses_andDeviceUID_withStream(
-            CATapDescription::alloc(),
-            &NSArray::<NSNumber>::new(),
-            &NSString::from_str(&d.uid),
-            0,
-        ),
-        Kind::Processes { target, .. } => {
-            let ids = |objects: &[u32]| {
-                let n: Vec<_> = objects.iter().map(|o| NSNumber::new_u32(*o)).collect();
-                NSArray::from_retained_slice(&n)
-            };
-            match target {
-                Target::Processes(o) => CATapDescription::initStereoMixdownOfProcesses(
-                    CATapDescription::alloc(),
-                    &ids(o),
+/// The tap descriptions `kind` needs (private, with its mute behaviour):
+/// one per target, and one per output stream of the device a
+/// [`Target::OnDevice`] names.
+///
+/// Every tap is a stereo mixdown except a [`Target::OnDevice`] one: a
+/// mixdown tap of processes on one device stream is not scoped to it at
+/// all, it hears what they play everywhere (measured on macOS 26.6 by
+/// `two_devices_a_scoped_tap_and_the_devices_listener`). Left alone, it
+/// takes the stream's own format, which the IOProc maps to the width asked
+/// for like a device's input (its first channels).
+unsafe fn descriptions(kind: &Kind) -> Result<Vec<Retained<CATapDescription>>, Error> {
+    let ids = |objects: &[u32]| {
+        let n: Vec<_> = objects.iter().map(|o| NSNumber::new_u32(*o)).collect();
+        NSArray::from_retained_slice(&n)
+    };
+    let alloc = CATapDescription::alloc;
+    let mut descs: Vec<(Retained<CATapDescription>, bool)> = Vec::new(); // (desc, mixdown)
+    let mute = match kind {
+        Kind::Device(d) => {
+            let uid = NSString::from_str(&d.uid);
+            let none = NSArray::<NSNumber>::new();
+            descs.push((
+                CATapDescription::initExcludingProcesses_andDeviceUID_withStream(
+                    alloc(),
+                    &none,
+                    &uid,
+                    0,
                 ),
-                Target::AllExcept(o) => CATapDescription::initStereoGlobalTapButExcludeProcesses(
-                    CATapDescription::alloc(),
-                    &ids(o),
-                ),
+                true,
+            ));
+            Mute::Unmuted
+        }
+        Kind::Processes { targets, mute, .. } => {
+            for target in targets {
+                match target {
+                    Target::Processes(o) => descs.push((
+                        CATapDescription::initStereoMixdownOfProcesses(alloc(), &ids(o)),
+                        true,
+                    )),
+                    Target::AllExcept(o) => descs.push((
+                        CATapDescription::initStereoGlobalTapButExcludeProcesses(alloc(), &ids(o)),
+                        true,
+                    )),
+                    Target::OnDevice(o, uid) => {
+                        let uid_ns = NSString::from_str(uid);
+                        for stream in 0..output_streams(uid)? {
+                            let desc = CATapDescription::initWithProcesses_andDeviceUID_withStream(
+                                alloc(),
+                                &ids(o),
+                                &uid_ns,
+                                stream as _,
+                            );
+                            descs.push((desc, false));
+                        }
+                    }
+                }
             }
+            *mute
         }
     };
-    let mute = match kind {
-        Kind::Device(_) | Kind::Processes { mute: Mute::Unmuted, .. } => CATapMuteBehavior::Unmuted,
-        Kind::Processes { mute: Mute::Muted, .. } => CATapMuteBehavior::Muted,
-        Kind::Processes { mute: Mute::MutedWhenTapped, .. } => CATapMuteBehavior::MutedWhenTapped,
+    let mute = match mute {
+        Mute::Unmuted => CATapMuteBehavior::Unmuted,
+        Mute::Muted => CATapMuteBehavior::Muted,
+        Mute::MutedWhenTapped => CATapMuteBehavior::MutedWhenTapped,
     };
-    desc.setName(&NSString::from_str(AGGREGATE_NAME));
-    desc.setMixdown(true);
-    desc.setMono(false);
-    desc.setPrivate(true);
-    desc.setMuteBehavior(mute);
+    let name = NSString::from_str(AGGREGATE_NAME);
+    Ok(descs
+        .into_iter()
+        .map(|(desc, mixdown)| {
+            desc.setName(&name);
+            if mixdown {
+                desc.setMixdown(true);
+                desc.setMono(false);
+            }
+            desc.setPrivate(true);
+            desc.setMuteBehavior(mute);
+            desc
+        })
+        .collect())
+}
+
+/// How many output streams the device with this UID has.
+fn output_streams(uid: &str) -> Result<usize, Error> {
+    let device = list_devices()?
+        .into_iter()
+        .find(|d| d.uid == uid && d.outputs)
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("output device {uid:?} is gone")))?;
+    Ok(get_vec::<AudioObjectID>(
+        device.id,
+        kAudioDevicePropertyStreams,
+        kAudioObjectPropertyScopeOutput,
+    )?
+    .len())
+}
+
+/// Make the process tap `desc` describes, push it onto `taps`, and return
+/// its UID. It is pushed before anything can fail after it, so the caller
+/// destroys it either way.
+unsafe fn create_tap(
+    desc: &CATapDescription,
+    taps: &mut Vec<AudioObjectID>,
+) -> Result<Retained<NSString>, Error> {
+    let mut tap = 0;
     check(
-        AudioHardwareCreateProcessTap(Some(&desc), tap),
+        AudioHardwareCreateProcessTap(Some(desc), &mut tap),
         "creating the process tap (macOS 14.2+)",
     )?;
+    taps.push(tap);
     Ok(desc.UUID().UUIDString())
 }
 
@@ -445,10 +521,10 @@ unsafe fn create_aggregate(clock: &NSString, taps: &[&NSString]) -> Result<Audio
     Ok(aggregate)
 }
 
-/// The real-time callback: the tap's frames, mapped to `channels` wide, into
-/// the feed. No allocation, locks, logging or I/O. The tap is the
-/// aggregate's last input stream (a tapped device's own inputs, if it has
-/// any, come first).
+/// The real-time callback: the taps' frames, each mapped to `channels`
+/// wide and summed, into the feed. No allocation, locks, logging or I/O.
+/// The taps are the aggregate's last input streams (a tapped device's own
+/// inputs, if it has any, come first).
 unsafe extern "C-unwind" fn io_proc(
     _device: AudioObjectID,
     _now: NonNull<AudioTimeStamp>,
@@ -466,32 +542,44 @@ unsafe extern "C-unwind" fn io_proc(
         return 0;
     }
     let buffers = std::slice::from_raw_parts((*list).mBuffers.as_ptr(), n);
-    let buf = &buffers[n - 1];
-    let src_ch = buf.mNumberChannels.max(1) as usize;
-    if buf.mData.is_null() {
-        return 0;
-    }
+    let taps = &buffers[n - ctx.taps.clamp(1, n)..];
+    let samples = |buf: &AudioBuffer| -> (&[f32], usize) {
+        if buf.mData.is_null() {
+            return (&[], 1);
+        }
+        let ch = buf.mNumberChannels.max(1) as usize;
+        (std::slice::from_raw_parts(buf.mData as *const f32, buf.mDataByteSize as usize / 4), ch)
+    };
     let time = input_time.as_ref();
     let ns = if time.mFlags.contains(AudioTimeStampFlags::HostTimeValid) {
         (time.mHostTime as u128 * ctx.numer as u128 / ctx.denom as u128) as u64
     } else {
         0
     };
-    let samples =
-        std::slice::from_raw_parts(buf.mData as *const f32, buf.mDataByteSize as usize / 4);
-    let frames = samples.len() / src_ch;
-    if src_ch == ctx.channels {
-        ctx.feed.push(&samples[..frames * src_ch], ns);
-        return 0;
-    }
     let ch = ctx.channels;
+    if let [one] = taps {
+        let (s, src_ch) = samples(one);
+        if src_ch == ch {
+            let frames = s.len() / src_ch;
+            ctx.feed.push(&s[..frames * src_ch], ns);
+            return 0;
+        }
+    }
+    // Every tap of one aggregate is called with the same frame count.
+    let frames = taps.iter().map(samples).map(|(s, c)| s.len() / c).max().unwrap_or(0);
     let mut done = 0;
     while done < frames {
         let count = (frames - done).min(MAP_FRAMES);
-        for f in 0..count {
-            let frame = &samples[(done + f) * src_ch..(done + f + 1) * src_ch];
-            for c in 0..ch {
-                ctx.scratch[f * ch + c] = frame[c.min(src_ch - 1)];
+        let out = &mut ctx.scratch[..count * ch];
+        out.fill(0.0);
+        for buf in taps {
+            let (s, src_ch) = samples(buf);
+            let have = (s.len() / src_ch).saturating_sub(done).min(count);
+            for f in 0..have {
+                let frame = &s[(done + f) * src_ch..(done + f + 1) * src_ch];
+                for c in 0..ch {
+                    out[f * ch + c] += frame[c.min(src_ch - 1)];
+                }
             }
         }
         let at = if ns == 0 { 0 } else { ns + (done as f64 * 1e9 / ctx.rate) as u64 };
@@ -625,7 +713,7 @@ impl Backend for Hal {
 
     fn open(
         &mut self,
-        target: &Target,
+        targets: &[Target],
         mute: Mute,
         sink: Sink,
     ) -> Result<(OutputTap, u32), (Error, Sink)> {
@@ -633,7 +721,7 @@ impl Backend for Hal {
             Ok(d) => d,
             Err(e) => return Err((e, sink)),
         };
-        let kind = Kind::Processes { target: target.clone(), mute, clock };
+        let kind = Kind::Processes { targets: targets.to_vec(), mute, clock };
         let tap = OutputTap::open(kind, self.rate, self.channels, sink)?;
         let rate = tap.sample_rate;
         Ok((tap, rate))
@@ -653,33 +741,6 @@ impl Backend for Hal {
 /// of the health check).
 const POLL: Duration = Duration::from_millis(500);
 
-/// Wakes the follower: from HAL listeners (a process came or went, a device
-/// list changed) or from its owner (stop).
-#[derive(Default)]
-struct Wake {
-    flags: Mutex<(bool, bool)>, // (pending, stop)
-    ready: Condvar,
-}
-
-impl Wake {
-    fn poke(&self, stop: bool) {
-        let mut f = self.flags.lock().unwrap_or_else(|e| e.into_inner());
-        f.0 = true;
-        f.1 |= stop;
-        self.ready.notify_all();
-    }
-
-    /// Until poked or POLL passes; true = stop.
-    fn wait(&self) -> bool {
-        let mut f = self.flags.lock().unwrap_or_else(|e| e.into_inner());
-        if !f.0 {
-            f = self.ready.wait_timeout(f, POLL).unwrap_or_else(|e| e.into_inner()).0;
-        }
-        f.0 = false;
-        f.1
-    }
-}
-
 unsafe extern "C-unwind" fn on_change(
     _object: AudioObjectID,
     _count: u32,
@@ -690,8 +751,33 @@ unsafe extern "C-unwind" fn on_change(
     0
 }
 
+/// The pointer HAL listeners poke `wake` through. A listener may still be
+/// running on a HAL thread as it is removed, so the pointer keeps its own
+/// reference, never released: one small allocation per capture, never
+/// touched once freed.
+fn client_of(wake: &Arc<Wake>) -> *const Wake {
+    Arc::into_raw(Arc::clone(wake))
+}
+
+/// Add or remove [`on_change`] for `client` on `object`'s `selector`.
+fn listener(
+    add: bool,
+    object: AudioObjectID,
+    (selector, scope): (AudioObjectPropertySelector, AudioObjectPropertyScope),
+    client: *const Wake,
+) {
+    let addr = address(selector, scope);
+    unsafe {
+        let f =
+            if add { AudioObjectAddPropertyListener } else { AudioObjectRemovePropertyListener };
+        // A process that is already gone refuses the removal: nothing to do.
+        f(object, NonNull::from(&addr), Some(on_change), client as *mut c_void);
+    }
+}
+
 /// A thread that ticks a follower: once at the start, then whenever one of
-/// its HAL properties changes (or [`POLL`] passes), until it is dropped.
+/// its system-object HAL properties changes (or [`POLL`] passes), until it
+/// is dropped.
 struct Watcher {
     wake: Arc<Wake>,
     /// The pointer the listeners were registered with.
@@ -705,68 +791,22 @@ unsafe impl Send for Watcher {}
 unsafe impl Sync for Watcher {}
 
 impl Watcher {
-    /// Run `tick` on a thread called `name`. Returns after the first tick:
-    /// its error is returned (and the thread ends); later ones are the
-    /// follower's own to report.
+    /// Run `tick` on a thread called `name`, woken by `wake` (see
+    /// [`watch::spawn`]).
     fn start<T>(
         name: &str,
+        wake: Arc<Wake>,
         selectors: &'static [AudioObjectPropertySelector],
-        mut tick: T,
+        tick: T,
     ) -> Result<Watcher, Error>
     where
         T: FnMut(Instant) -> Result<(), Error> + Send + 'static,
     {
-        let wake = Arc::new(Wake::default());
-        let (first_tx, first_rx) = mpsc::channel::<Result<(), Error>>();
-        let thread = {
-            let wake = Arc::clone(&wake);
-            std::thread::Builder::new()
-                .name(name.into())
-                .spawn(move || {
-                    let first = tick(Instant::now());
-                    let failed = first.is_err();
-                    let _ = first_tx.send(first);
-                    if failed {
-                        return;
-                    }
-                    while !wake.wait() {
-                        let _ = tick(Instant::now());
-                    }
-                    // Dropping `tick` drops the follower, which destroys
-                    // its tap.
-                })
-                .map_err(|e| {
-                    Error::new(ErrorKind::Device, format!("cannot start the {name} thread: {e}"))
-                })?
-        };
-        match first_rx.recv() {
-            Ok(Err(e)) => {
-                let _ = thread.join();
-                return Err(e);
-            }
-            Ok(Ok(())) => {}
-            Err(_) => {
-                let _ = thread.join();
-                return Err(Error::new(
-                    ErrorKind::Device,
-                    format!("the {name} thread died before reporting"),
-                ));
-            }
-        }
-        // A listener may still be running on a HAL thread as it is removed,
-        // so the pointer it holds keeps its own reference, never released:
-        // one small allocation per capture, never touched once freed.
-        let client = Arc::into_raw(Arc::clone(&wake));
+        let thread = watch::spawn(name, Arc::clone(&wake), tick)?;
+        let client = client_of(&wake);
         for &selector in selectors {
-            let addr = address(selector, kAudioObjectPropertyScopeGlobal);
-            unsafe {
-                AudioObjectAddPropertyListener(
-                    kAudioObjectSystemObject as AudioObjectID,
-                    NonNull::from(&addr),
-                    Some(on_change),
-                    client as *mut c_void,
-                );
-            }
+            let at = (selector, kAudioObjectPropertyScopeGlobal);
+            listener(true, kAudioObjectSystemObject as AudioObjectID, at, client);
         }
         Ok(Watcher { wake, client, selectors, thread: Some(thread) })
     }
@@ -775,15 +815,8 @@ impl Watcher {
 impl Drop for Watcher {
     fn drop(&mut self) {
         for &selector in self.selectors {
-            let addr = address(selector, kAudioObjectPropertyScopeGlobal);
-            unsafe {
-                AudioObjectRemovePropertyListener(
-                    kAudioObjectSystemObject as AudioObjectID,
-                    NonNull::from(&addr),
-                    Some(on_change),
-                    self.client as *mut c_void,
-                );
-            }
+            let at = (selector, kAudioObjectPropertyScopeGlobal);
+            listener(false, kAudioObjectSystemObject as AudioObjectID, at, self.client);
         }
         self.wake.poke(true);
         if let Some(t) = self.thread.take() {
@@ -792,10 +825,45 @@ impl Drop for Watcher {
     }
 }
 
+/// The HAL's [`Listen`]: wakes the follower when a process object's
+/// `kAudioProcessPropertyDevices` changes (it moved to another device).
+struct DevicesListen {
+    client: *const Wake,
+}
+
+// `client` is only handed to CoreAudio.
+unsafe impl Send for DevicesListen {}
+
+/// A process's devices, in any scope (output is the one read).
+const DEVICES: (AudioObjectPropertySelector, AudioObjectPropertyScope) =
+    (kAudioProcessPropertyDevices, kAudioObjectPropertyScopeWildcard);
+
+impl Listen for DevicesListen {
+    fn add(&mut self, object: u32) {
+        listener(true, object, DEVICES, self.client);
+    }
+    fn remove(&mut self, object: u32) {
+        listener(false, object, DEVICES, self.client);
+    }
+}
+
 /// What pokes an app follower: a process came or went, a device list
-/// changed.
+/// changed. (And, for a tap that reads them, a process's devices changed:
+/// [`DevicesListen`].)
 const APPS_WATCHED: [AudioObjectPropertySelector; 2] =
     [kAudioHardwarePropertyProcessObjectList, kAudioHardwarePropertyDevices];
+
+/// The backend an app follower runs on: the HAL, with a listener on each
+/// process's devices when the tap reads them.
+fn app_backend(
+    tap: &AppTap,
+    rate: u32,
+    channels: usize,
+    wake: &Arc<Wake>,
+) -> Listened<Hal, DevicesListen> {
+    let hal = Hal { rate, channels, cache: HashMap::new(), devices: tap.needs_devices() };
+    Listened::new(hal, tap, || DevicesListen { client: client_of(wake) })
+}
 
 /// A running app follower: its thread owns the [`Follow`] and the tap.
 pub(crate) struct Following {
@@ -813,11 +881,24 @@ impl Following {
         channels: usize,
         sink: Sink,
     ) -> Result<Following, Error> {
+        Following::start_polling(tap, rate, channels, sink, POLL)
+    }
+
+    /// [`start`](Following::start), looking every `poll` when nothing woke
+    /// it (a hand check makes it long, to see the listeners at work).
+    fn start_polling(
+        tap: AppTap,
+        rate: u32,
+        channels: usize,
+        sink: Sink,
+        poll: Duration,
+    ) -> Result<Following, Error> {
         let status = Arc::new(Mutex::new(AppStatus::Failed { error: "starting".into() }));
-        let hal = Hal { rate, channels, cache: HashMap::new(), devices: tap.needs_devices() };
-        let mut follow = Follow::new(hal, tap, std::process::id() as i32, sink);
+        let wake = Arc::new(Wake::new(poll));
+        let backend = app_backend(&tap, rate, channels, &wake);
+        let mut follow = Follow::new(backend, tap, std::process::id() as i32, sink);
         let shared = Arc::clone(&status);
-        let watcher = Watcher::start("audio app tap", &APPS_WATCHED, move |now| {
+        let watcher = Watcher::start("audio app tap", wake, &APPS_WATCHED, move |now| {
             let s = follow.tick(now).clone();
             *shared.lock().unwrap_or_else(|e| e.into_inner()) = s.clone();
             match s {
@@ -850,10 +931,11 @@ impl Channels {
         sinks: S,
     ) -> Result<Channels, Error> {
         let status = Arc::new(Mutex::new(ChannelsStatus::default()));
-        let hal = Hal { rate, channels, cache: HashMap::new(), devices: tap.needs_devices() };
-        let mut split = Split::new(hal, tap, std::process::id() as i32, sinks);
+        let wake = Arc::new(Wake::new(POLL));
+        let backend = app_backend(&tap, rate, channels, &wake);
+        let mut split = Split::new(backend, tap, std::process::id() as i32, sinks);
         let shared = Arc::clone(&status);
-        let watcher = Watcher::start("audio app channels", &APPS_WATCHED, move |now| {
+        let watcher = Watcher::start("audio app channels", wake, &APPS_WATCHED, move |now| {
             let s = split.tick(now).clone();
             *shared.lock().unwrap_or_else(|e| e.into_inner()) = s;
             Ok(())
@@ -927,11 +1009,13 @@ impl DefaultTap {
         let now = Arc::new(Mutex::new(Now::default()));
         let mut follow = FollowDefault::new(Defaults { rate, channels }, sink);
         let shared = Arc::clone(&now);
-        let watcher = Watcher::start("audio default output tap", &DEFAULT_WATCHED, move |t| {
-            let r = follow.tick(t).map(|_| ());
-            *shared.lock().unwrap_or_else(|e| e.into_inner()) = follow.now().clone();
-            r
-        })?;
+        let wake = Arc::new(Wake::new(POLL));
+        let watcher =
+            Watcher::start("audio default output tap", wake, &DEFAULT_WATCHED, move |t| {
+                let r = follow.tick(t).map(|_| ());
+                *shared.lock().unwrap_or_else(|e| e.into_inner()) = follow.now().clone();
+                r
+            })?;
         Ok(DefaultTap { now, _watcher: watcher })
     }
 
@@ -1166,6 +1250,177 @@ mod tests {
         drop(stream);
     }
 
+    /// The hand check for a process playing into two devices at once, and
+    /// for the follower being woken when a process changes device. Needs a
+    /// second output device (BlackHole, a Tussen device, any other one),
+    /// and skips itself unless System Audio Recording is granted, so it
+    /// never raises the prompt:
+    /// `cargo test -p simply-audio-capture two_devices -- --ignored --nocapture`.
+    ///
+    /// This process plays a 997 Hz tone at -80 dBFS (inaudible) to the
+    /// default output and a 1499 Hz tone at -12 dBFS to the other device.
+    /// 1. Device-scoped taps of this process (`CATapDescription
+    ///    initWithProcesses:andDeviceUID:withStream:`): the one on the other
+    ///    device hears only 1499 Hz, the one on the default output only
+    ///    997 Hz; a plain process tap hears both. (Made a stereo mixdown, a
+    ///    scoped tap hears both too: see [`descriptions`].)
+    /// 2. "Everything except whatever plays into the other device", with a
+    ///    60 s poll: the other device's stream is made only after the
+    ///    follower started, so only the listener on this process's devices
+    ///    can make the follower re-make its taps within the 5 s allowed.
+    ///    Then it hears 997 Hz (this process's default-output part) and not
+    ///    1499 Hz. Other apps playing on the Mac add to what it hears.
+    #[test]
+    #[ignore]
+    fn two_devices_a_scoped_tap_and_the_devices_listener() {
+        use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+        let _serial = REAL_TAP.lock().unwrap_or_else(|e| e.into_inner());
+        if permission() != Permission::Granted {
+            eprintln!("skipped: System Audio Recording is {:?}", permission());
+            return;
+        }
+        let default = find_output("").unwrap();
+        let outputs: Vec<Device> = list_devices()
+            .unwrap()
+            .into_iter()
+            .filter(|d| d.outputs && d.id != default.id)
+            .collect();
+        let Some(other) = outputs
+            .iter()
+            .find(|d| d.name.contains("BlackHole") || d.uid.starts_with("com.simply.audio.tussen."))
+            .or(outputs.iter().find(|d| d.name != AGGREGATE_NAME))
+            .cloned()
+        else {
+            eprintln!("skipped: no second output device");
+            return;
+        };
+        eprintln!(
+            "default output {:?}, other device {:?} ({})",
+            default.name, other.name, other.uid
+        );
+        let tone = |name: &str, hz: f32, amp: f32| -> cpal::Stream {
+            let host = cpal::default_host();
+            let dev = host
+                .output_devices()
+                .unwrap()
+                .find(|d| crate::device_name(d).as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("cpal has no {name:?}"));
+            let config = dev.default_output_config().unwrap().config();
+            let (rate, ch) = (config.sample_rate as f32, config.channels as usize);
+            let mut phase = 0f32;
+            let s = dev
+                .build_output_stream::<f32, _, _>(
+                    config,
+                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                        for frame in data.chunks_mut(ch) {
+                            frame.fill(amp * (phase * std::f32::consts::TAU).sin());
+                            phase = (phase + hz / rate).fract();
+                        }
+                    },
+                    |_| {},
+                    None,
+                )
+                .unwrap();
+            s.play().unwrap();
+            s
+        };
+        type Heard = Arc<Mutex<Vec<f32>>>;
+        let into = |heard: &Heard| -> Sink {
+            let heard = Arc::clone(heard);
+            Box::new(move |f: &[f32], _| {
+                heard.lock().unwrap().extend(f.chunks(2).map(|c| c[0]));
+            })
+        };
+        // Amplitude of `hz` in the last second heard (Goertzel).
+        let level = |heard: &Heard, hz: f64| -> f64 {
+            let h = heard.lock().unwrap();
+            let x = &h[h.len().saturating_sub(48_000)..];
+            let k = 2.0 * (std::f64::consts::TAU * hz / 48_000.0).cos();
+            let (mut s1, mut s2) = (0.0, 0.0);
+            for &v in x {
+                let s0 = v as f64 + k * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            let power = s1 * s1 + s2 * s2 - k * s1 * s2;
+            2.0 * power.max(0.0).sqrt() / x.len().max(1) as f64
+        };
+        let (quiet, loud) = (1e-4f64, 0.25f64);
+
+        let _near = tone(&default.name, 997.0, quiet as f32);
+        let far = tone(&other.name, 1499.0, loud as f32);
+        std::thread::sleep(Duration::from_millis(500));
+        let me = translate_pid(std::process::id() as i32).expect("playing makes a client");
+        let mine = list_processes(&mut HashMap::new(), true).into_iter().find(|p| p.object == me);
+        eprintln!("this process plays into {:?}", mine.map(|p| p.devices));
+
+        // 1. The API itself.
+        let tap_for = |targets: Vec<Target>| {
+            let heard = Heard::default();
+            let kind = Kind::Processes { targets, mute: Mute::Unmuted, clock: default.clone() };
+            let tap = OutputTap::open(kind, 48_000, 2, into(&heard)).map_err(|(e, _)| e).unwrap();
+            std::thread::sleep(Duration::from_millis(1500));
+            let got = (level(&heard, 997.0), level(&heard, 1499.0));
+            drop(tap);
+            got
+        };
+        let on_other = tap_for(vec![Target::OnDevice(vec![me], other.uid.clone())]);
+        let on_default = tap_for(vec![Target::OnDevice(vec![me], default.uid.clone())]);
+        let whole = tap_for(vec![Target::Processes(vec![me])]);
+        eprintln!(
+            "scoped to {:?}: 997 Hz {:.2e}, 1499 Hz {:.2e}",
+            other.name, on_other.0, on_other.1
+        );
+        eprintln!(
+            "scoped to {:?}: 997 Hz {:.2e}, 1499 Hz {:.2e}",
+            default.name, on_default.0, on_default.1
+        );
+        eprintln!("whole process: 997 Hz {:.2e}, 1499 Hz {:.2e}", whole.0, whole.1);
+        assert!(on_other.1 > loud / 2.0 && on_other.0 < quiet / 10.0, "{on_other:?}");
+        assert!(on_default.0 > quiet / 2.0 && on_default.1 < quiet, "{on_default:?}");
+        assert!(whole.0 > quiet / 2.0 && whole.1 > loud / 2.0, "{whole:?}");
+
+        // 2. The follower, woken by this process's devices changing.
+        drop(far);
+        std::thread::sleep(Duration::from_millis(500));
+        let ours = || -> Vec<AudioObjectID> {
+            list_devices()
+                .unwrap()
+                .iter()
+                .filter(|d| d.name == AGGREGATE_NAME)
+                .map(|d| d.id)
+                .collect()
+        };
+        let heard = Heard::default();
+        let tap = AppTap::all_except([crate::App::PlayingInto(other.uid.clone())]);
+        let f = Following::start_polling(tap, 48_000, 2, into(&heard), Duration::from_secs(60))
+            .unwrap();
+        assert!(f.status().is_tapping(), "{}", f.status());
+        let first = ours();
+        let _far = tone(&other.name, 1499.0, loud as f32);
+        let t = Instant::now();
+        while ours() == first {
+            assert!(t.elapsed() < Duration::from_secs(5), "not woken by the device change");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        eprintln!(
+            "re-made {:.0} ms after the other device's stream started",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        std::thread::sleep(Duration::from_millis(1500));
+        let got = (level(&heard, 997.0), level(&heard, 1499.0));
+        eprintln!(
+            "everything except {:?}: 997 Hz {:.2e}, 1499 Hz {:.2e}; {}",
+            other.name,
+            got.0,
+            got.1,
+            f.status()
+        );
+        assert!(got.0 > quiet / 2.0 && got.1 < loud / 100.0, "{got:?}");
+        drop(f);
+        assert!(ours().is_empty());
+    }
+
     /// Make this process an audio client of the default output, with a
     /// stream of silence that plays once started.
     fn silence() -> cpal::Stream {
@@ -1202,7 +1457,7 @@ mod tests {
         }
         let clock = find_output("").unwrap();
         let one = |object: u32| Kind::Processes {
-            target: Target::Processes(vec![object]),
+            targets: vec![Target::Processes(vec![object])],
             mute: Mute::Unmuted,
             clock: clock.clone(),
         };
@@ -1269,9 +1524,12 @@ mod tests {
         // One aggregate, taps added and removed while it runs.
         let other = procs.iter().find(|p| p.object != me).expect("coreaudiod has other clients");
         unsafe {
-            let (mut a, mut b) = (0, 0);
-            let uid_a = create_tap(&one(me), &mut a).unwrap();
-            let uid_b = create_tap(&one(other.object), &mut b).unwrap();
+            let mut made = Vec::new();
+            let mut tap_of = |object| {
+                let desc = descriptions(&one(object)).unwrap().remove(0);
+                create_tap(&desc, &mut made).unwrap()
+            };
+            let (uid_a, uid_b) = (tap_of(me), tap_of(other.object));
             let clock_uid = NSString::from_str(&clock.uid);
             let agg = create_aggregate(&clock_uid, &[&uid_a]).unwrap();
             let probe = Box::into_raw(Box::new(Probe::default()));
@@ -1339,8 +1597,9 @@ mod tests {
             AudioDeviceDestroyIOProcID(agg, proc_id);
             drop(Box::from_raw(probe));
             AudioHardwareDestroyAggregateDevice(agg);
-            AudioHardwareDestroyProcessTap(a);
-            AudioHardwareDestroyProcessTap(b);
+            for tap in made {
+                AudioHardwareDestroyProcessTap(tap);
+            }
         }
         drop(stream);
         assert_eq!(ours(), 0);

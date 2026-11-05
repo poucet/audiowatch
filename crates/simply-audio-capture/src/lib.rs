@@ -41,9 +41,12 @@
 //!   [`App::This`], so your own output doesn't feed back).
 //!
 //! [`App::PlayingInto`] names processes by the output device they play
-//! into (a device UID prefix), and is re-read as they move: a program with
-//! its own virtual devices leaves out what already reaches it through them,
-//! so the tap doesn't carry it twice.
+//! into (a device UID prefix), and is re-read the moment one moves (a HAL
+//! listener on each process's devices): a program with its own virtual
+//! devices leaves out what already reaches it through them, so the tap
+//! doesn't carry it twice. In [`Apps::AllExcept`] only that output is left
+//! out: an app playing into such a device and into the speakers at once is
+//! still heard from the speakers, through a tap of its own scoped to them.
 //!
 //! The capture **follows** the apps. While none of them runs it reports
 //! [`AppStatus::Waiting`] ("waiting for djay Pro"); it attaches when one
@@ -107,6 +110,8 @@ mod channels;
 mod default_out;
 #[cfg(target_os = "macos")]
 mod tap;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod watch;
 
 pub use apps::{App, AppInfo, AppStatus, AppTap, Apps, Mute};
 pub use channels::{AppChannel, AppSinks, ChannelState, ChannelsStatus, CHANNEL_HOLD};
@@ -521,7 +526,9 @@ impl AppChannels {
 /// Tap applications as [`start_app`] does, but **each app on its own
 /// channel** rather than one mix: every process `tap` selects gets its own
 /// process tap, from when it starts playing until it exits, leaves the
-/// selection (an [`App::PlayingInto`] it now plays into) or has been quiet
+/// selection (it now plays only into an [`App::PlayingInto`] device; one
+/// that plays there and elsewhere keeps its channel, for the elsewhere) or
+/// has been quiet
 /// for [`CHANNEL_HOLD`]. `sinks` hears each channel start and stop and
 /// gives each its sink: `channels`-wide frames at `rate`, exactly as
 /// [`start`]'s (see the crate docs).

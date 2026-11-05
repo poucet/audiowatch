@@ -30,7 +30,9 @@ pub enum App {
     /// this prefix, followed as processes start and stop playing there.
     /// In [`Apps::AllExcept`] it keeps a program's own virtual devices out
     /// of "everything": an app playing into one reaches the program
-    /// through that device, so the tap would carry it twice.
+    /// through that device, so the tap would carry it twice. Only that
+    /// output is left out: what the app plays into other devices at the
+    /// same time is still tapped there.
     PlayingInto(String),
 }
 
@@ -70,10 +72,14 @@ impl App {
             }
             App::Pid(pid) => p.pid == *pid,
             App::This => p.pid == this,
-            App::PlayingInto(prefix) => {
-                p.devices.iter().any(|uid| uid.starts_with(prefix.as_str()))
-            }
+            App::PlayingInto(_) => p.devices.iter().any(|uid| self.covers_device(uid)),
         }
+    }
+
+    /// Whether this app names the output device `uid` (an
+    /// [`App::PlayingInto`] whose prefix it starts with).
+    pub(crate) fn covers_device(&self, uid: &str) -> bool {
+        matches!(self, App::PlayingInto(prefix) if uid.starts_with(prefix.as_str()))
     }
 
     /// Whether matching this app needs the devices each process plays into.
@@ -210,7 +216,8 @@ pub enum AppStatus {
     /// what disappeared, when one was being tapped.
     Waiting { waiting_for: String, reason: Option<String> },
     /// Audio is flowing. `processes`: the ones tapped ([`Apps::Only`]) or
-    /// the ones left out ([`Apps::AllExcept`]). `missing`: the apps asked
+    /// the ones left out whole ([`Apps::AllExcept`]; one left out of some
+    /// devices only is still heard on the others, so it is not listed). `missing`: the apps asked
     /// for that aren't running (yet).
     Tapping { processes: Vec<AppInfo>, missing: Vec<String>, device_rate: u32 },
     /// The tap could not be made; it is retried every few seconds.
@@ -258,13 +265,27 @@ pub(crate) struct Proc {
     pub devices: Vec<String>,
 }
 
-/// What the HAL is asked to tap.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One tap the HAL is asked to make. A capture is one or more of them,
+/// mixed in one aggregate.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Target {
     /// Stereo mixdown of these process objects.
     Processes(Vec<u32>),
     /// Stereo mixdown of everything except these process objects.
     AllExcept(Vec<u32>),
+    /// Stereo mixdown of what these process objects play into the output
+    /// device with this UID, and nothing they play elsewhere.
+    OnDevice(Vec<u32>, String),
+}
+
+/// A process a tap takes in: all of it, or (`devices`) only what it plays
+/// into these output devices.
+#[derive(Clone, Debug)]
+pub(crate) struct Tapped<'a> {
+    pub proc: &'a Proc,
+    /// `None`: all of the process. `Some`: only its output into these
+    /// devices (by UID); the rest of it is left out.
+    pub devices: Option<Vec<String>>,
 }
 
 /// The side effects [`Follow`] needs. The real one (macOS) makes process
@@ -276,10 +297,11 @@ pub(crate) trait Backend {
     /// `kAudioHardwarePropertyTranslatePIDToProcessObject`: the process
     /// object of `pid`, if it is an audio client.
     fn translate(&mut self, pid: i32) -> Option<u32>;
-    /// Make a tap and start it into `sink`; on failure the sink comes back.
+    /// Make the taps `targets` (one or more, mixed) and start them into
+    /// `sink`; on failure the sink comes back.
     fn open(
         &mut self,
-        target: &Target,
+        targets: &[Target],
         mute: Mute,
         sink: Sink,
     ) -> Result<(Self::Tap, u32), (Error, Sink)>;
@@ -297,7 +319,7 @@ pub(crate) const RETRY: Duration = Duration::from_secs(3);
 
 struct Open<T> {
     tap: T,
-    key: Vec<u32>,
+    key: Vec<Target>,
     procs: Vec<AppInfo>,
 }
 
@@ -311,8 +333,8 @@ pub(crate) struct Follow<B: Backend> {
     sink: Option<Sink>,
     open: Option<Open<B::Tap>>,
     status: AppStatus,
-    /// The last target that failed to open, and when.
-    failed: Option<(Vec<u32>, Instant)>,
+    /// The last targets that failed to open, and when.
+    failed: Option<(Vec<Target>, Instant)>,
 }
 
 impl<B: Backend> Follow<B> {
@@ -330,14 +352,20 @@ impl<B: Backend> Follow<B> {
     pub(crate) fn tick(&mut self, now: Instant) -> &AppStatus {
         let procs = self.backend.processes();
         let (matched, missing) = resolve(&mut self.backend, &self.tap, self.this, &procs);
-        let mut key: Vec<u32> = matched.iter().map(|p| p.object).collect();
-        key.sort_unstable();
-        key.dedup();
+        let taken = tapped(&self.tap, self.this, &procs, &matched);
+        let key = targets(&self.tap.apps, &matched, &taken);
         let want = match self.tap.apps {
-            Apps::Only(_) => !key.is_empty(),
+            Apps::Only(_) => !matched.is_empty(),
             Apps::AllExcept(_) => true,
         };
-        let infos: Vec<AppInfo> = matched.iter().map(|p| AppInfo::of(p, self.this)).collect();
+        // Only: the ones tapped. AllExcept: the ones left out whole (one
+        // left out only from some devices is still heard on the others).
+        let only = matches!(self.tap.apps, Apps::Only(_));
+        let infos: Vec<AppInfo> = matched
+            .iter()
+            .filter(|p| only || !taken.iter().any(|t| t.proc.object == p.object))
+            .map(|p| AppInfo::of(p, self.this))
+            .collect();
 
         let mut reason = match &self.status {
             AppStatus::Waiting { reason, .. } => reason.clone(),
@@ -346,7 +374,7 @@ impl<B: Backend> Follow<B> {
         if let Some(open) = &self.open {
             // A paused app's tap is not called back: that silence is not
             // a stall, so it is not re-made for it.
-            let playing = tapped(&self.tap.apps, &procs, &matched).iter().any(|p| p.playing);
+            let playing = taken.iter().any(|t| t.proc.playing);
             let problem = self.backend.health(&open.tap, playing);
             if problem.is_none() && want && open.key == key {
                 if let AppStatus::Tapping { missing: m, .. } = &mut self.status {
@@ -370,12 +398,8 @@ impl<B: Backend> Follow<B> {
                 return &self.status;
             }
         }
-        let target = match self.tap.apps {
-            Apps::Only(_) => Target::Processes(key.clone()),
-            Apps::AllExcept(_) => Target::AllExcept(key.clone()),
-        };
         let sink = self.sink.take().expect("no tap holds the sink");
-        match self.backend.open(&target, self.tap.mute, sink) {
+        match self.backend.open(&key, self.tap.mute, sink) {
             Ok((tap, device_rate)) => {
                 self.failed = None;
                 self.status = AppStatus::Tapping { processes: infos.clone(), missing, device_rate };
@@ -435,11 +459,79 @@ pub(crate) fn resolve<B: Backend>(
 
 /// The processes a tap takes in, given what [`resolve`] matched: the
 /// matched ones for [`Apps::Only`], every other one for [`Apps::AllExcept`].
-pub(crate) fn tapped<'a>(apps: &Apps, procs: &'a [Proc], matched: &'a [Proc]) -> Vec<&'a Proc> {
+///
+/// One exception for [`Apps::AllExcept`]: a process left out only because
+/// it plays into an [`App::PlayingInto`] device, that also plays into
+/// other devices, is taken in on those others ([`Tapped::devices`]). Its
+/// output into the left-out devices is all that is left out.
+pub(crate) fn tapped<'a>(
+    tap: &AppTap,
+    this: i32,
+    procs: &'a [Proc],
+    matched: &'a [Proc],
+) -> Vec<Tapped<'a>> {
+    let whole = |p: &'a Proc| Tapped { proc: p, devices: None };
+    let apps = match &tap.apps {
+        Apps::Only(_) => return matched.iter().map(whole).collect(),
+        Apps::AllExcept(apps) => apps,
+    };
+    let mut taken: Vec<Tapped<'a>> =
+        procs.iter().filter(|p| !matched.iter().any(|m| m.object == p.object)).map(whole).collect();
+    for p in matched {
+        // Left out by who it is (`This`, a bundle, a pid): all of it.
+        if apps.iter().any(|a| !a.needs_devices() && a.matches(p, this)) {
+            continue;
+        }
+        let mut kept: Vec<String> = p
+            .devices
+            .iter()
+            .filter(|uid| !apps.iter().any(|a| a.covers_device(uid)))
+            .cloned()
+            .collect();
+        kept.sort_unstable();
+        kept.dedup();
+        if !kept.is_empty() {
+            taken.push(Tapped { proc: p, devices: Some(kept) });
+        }
+    }
+    taken
+}
+
+/// The taps that take in `taken`: one for [`Apps::Only`]; for
+/// [`Apps::AllExcept`], the global one leaving out every matched process,
+/// plus one per device that a partly left-out process still plays into.
+/// Sorted, so it is the key that says whether the taps must change.
+pub(crate) fn targets(apps: &Apps, matched: &[Proc], taken: &[Tapped]) -> Vec<Target> {
+    let mut objects: Vec<u32> = matched.iter().map(|p| p.object).collect();
+    objects.sort_unstable();
+    objects.dedup();
     match apps {
-        Apps::Only(_) => matched.iter().collect(),
+        Apps::Only(_) => vec![Target::Processes(objects)],
         Apps::AllExcept(_) => {
-            procs.iter().filter(|p| !matched.iter().any(|m| m.object == p.object)).collect()
+            let mut on: std::collections::BTreeMap<&str, Vec<u32>> = Default::default();
+            for t in taken {
+                for uid in t.devices.iter().flatten() {
+                    on.entry(uid.as_str()).or_default().push(t.proc.object);
+                }
+            }
+            let mut v = vec![Target::AllExcept(objects)];
+            v.extend(on.into_iter().map(|(uid, mut o)| {
+                o.sort_unstable();
+                o.dedup();
+                Target::OnDevice(o, uid.to_owned())
+            }));
+            v
+        }
+    }
+}
+
+/// The taps of one process's own channel: all of it, or what it plays into
+/// each of `devices`.
+pub(crate) fn own_targets(t: &Tapped) -> Vec<Target> {
+    match &t.devices {
+        None => vec![Target::Processes(vec![t.proc.object])],
+        Some(ds) => {
+            ds.iter().map(|uid| Target::OnDevice(vec![t.proc.object], uid.clone())).collect()
         }
     }
 }
@@ -610,7 +702,7 @@ pub(crate) mod tests {
         pub(crate) fail: Option<String>,
         /// A tap's health problem, by tap id.
         pub(crate) sick: Option<String>,
-        pub(crate) opened: Vec<(Target, Mute)>,
+        pub(crate) opened: Vec<(Vec<Target>, Mute)>,
         pub(crate) closed: Vec<u32>,
         pub(crate) next: u32,
         pub(crate) live: Vec<u32>,
@@ -634,7 +726,7 @@ pub(crate) mod tests {
         }
         fn open(
             &mut self,
-            target: &Target,
+            targets: &[Target],
             mute: Mute,
             sink: Sink,
         ) -> Result<(Self::Tap, u32), (Error, Sink)> {
@@ -642,7 +734,7 @@ pub(crate) mod tests {
             if let Some(e) = s.fail.take() {
                 return Err((Error::new(ErrorKind::Device, e), sink));
             }
-            s.opened.push((target.clone(), mute));
+            s.opened.push((targets.to_vec(), mute));
             // One stereo frame, so a test can tell which sink a tap feeds.
             let mut sink = sink;
             sink(&[0.0, 0.0], 0);
@@ -685,7 +777,7 @@ pub(crate) mod tests {
 
         set(&fake, vec![proc(3, 5, "com.apple.Music", "/x/Music"), proc(10, 412, DJAY, DJAY_EXE)]);
         assert_eq!(f.tick(t).to_string(), "tapping djay Pro (pid 412) at 48000 Hz");
-        assert_eq!(fake.0.borrow().opened, [(Target::Processes(vec![10]), Mute::Unmuted)]);
+        assert_eq!(fake.0.borrow().opened, [(vec![Target::Processes(vec![10])], Mute::Unmuted)]);
 
         // Nothing changed: the tap is left alone.
         f.tick(t);
@@ -709,7 +801,7 @@ pub(crate) mod tests {
         set(&fake, vec![proc(27, 500, DJAY, DJAY_EXE)]);
         assert_eq!(f.tick(t).to_string(), "tapping djay Pro (pid 500) at 48000 Hz");
         let opened = &fake.0.borrow().opened;
-        assert_eq!(opened.last(), Some(&(Target::Processes(vec![27]), Mute::Muted)));
+        assert_eq!(opened.last(), Some(&(vec![Target::Processes(vec![27])], Mute::Muted)));
     }
 
     #[test]
@@ -740,7 +832,7 @@ pub(crate) mod tests {
             vec![proc(10, 412, DJAY, DJAY_EXE), proc(4, 77, "com.spotify.client", "/x/Spotify")],
         );
         f.tick(t);
-        assert_eq!(fake.0.borrow().opened.last().unwrap().0, Target::Processes(vec![4, 10]));
+        assert_eq!(fake.0.borrow().opened.last().unwrap().0, [Target::Processes(vec![4, 10])]);
         match f.status() {
             AppStatus::Tapping { missing, processes, .. } => {
                 assert!(missing.is_empty());
@@ -756,12 +848,12 @@ pub(crate) mod tests {
         let t = Instant::now();
         set(&fake, vec![proc(10, 412, DJAY, DJAY_EXE)]);
         assert!(f.tick(t).is_tapping());
-        assert_eq!(fake.0.borrow().opened, [(Target::AllExcept(vec![]), Mute::Unmuted)]);
+        assert_eq!(fake.0.borrow().opened, [(vec![Target::AllExcept(vec![])], Mute::Unmuted)]);
 
         // This process starts playing, so the HAL lists it: leave it out.
         set(&fake, vec![proc(10, 412, DJAY, DJAY_EXE), proc(12, ME, "", "/x/simply-tussen")]);
         assert!(f.tick(t).is_tapping());
-        assert_eq!(fake.0.borrow().opened.last().unwrap().0, Target::AllExcept(vec![12]));
+        assert_eq!(fake.0.borrow().opened.last().unwrap().0, [Target::AllExcept(vec![12])]);
         assert_eq!(fake.0.borrow().live.len(), 1);
     }
 
@@ -775,13 +867,13 @@ pub(crate) mod tests {
         let me = plays(proc(12, ME, "", "/x/simply-tussen"), &[TUSSEN_IN_1]);
         set(&fake, vec![djay.clone(), music.clone(), me.clone()]);
         assert!(f.tick(t).is_tapping());
-        assert_eq!(fake.0.borrow().opened, [(Target::AllExcept(vec![12]), Mute::Unmuted)]);
+        assert_eq!(fake.0.borrow().opened, [(vec![Target::AllExcept(vec![12])], Mute::Unmuted)]);
 
         // Music starts playing into Tussen In 1: it reaches tussen through
         // that device, so the tap is re-made without it.
         set(&fake, vec![djay.clone(), plays(music.clone(), &[TUSSEN_IN_1]), me.clone()]);
         assert!(f.tick(t).is_tapping());
-        assert_eq!(fake.0.borrow().opened.last().unwrap().0, Target::AllExcept(vec![3, 12]));
+        assert_eq!(fake.0.borrow().opened.last().unwrap().0, [Target::AllExcept(vec![3, 12])]);
         assert_eq!((fake.0.borrow().closed.as_slice(), fake.0.borrow().live.len()), (&[1][..], 1));
         // Nothing else changed: the tap is left alone.
         f.tick(t);
@@ -791,10 +883,66 @@ pub(crate) mod tests {
         set(&fake, vec![djay, music, me]);
         assert!(f.tick(t).is_tapping());
         let s = fake.0.borrow();
-        assert_eq!(s.opened.last().unwrap().0, Target::AllExcept(vec![12]));
+        assert_eq!(s.opened.last().unwrap().0, [Target::AllExcept(vec![12])]);
         assert_eq!(
             (s.opened.len(), s.closed.as_slice(), s.live.as_slice()),
             (3, &[1, 2][..], &[3][..])
+        );
+    }
+
+    #[test]
+    fn an_app_playing_into_tussen_and_the_speakers_is_tapped_on_the_speakers_only() {
+        let (fake, mut f) =
+            follow(AppTap::all_except([App::This, App::PlayingInto(TUSSEN.into())]));
+        let t = Instant::now();
+        let djay = proc(10, 412, DJAY, DJAY_EXE);
+        let music = proc(3, 5, MUSIC, "/x/Music");
+        let me = plays(proc(12, ME, "", "/x/simply-tussen"), &[TUSSEN_IN_1, SPEAKERS]);
+        let both = plays(music.clone(), &[TUSSEN_IN_1, SPEAKERS, "AirPods"]);
+        set(&fake, vec![djay.clone(), both, me.clone()]);
+        // Music is left out of everything, and tapped again where it plays
+        // besides Tussen: on the speakers and the AirPods, each its own
+        // device-scoped tap, mixed into the one capture. Tussen itself
+        // (`This`) is left out whole, wherever it plays.
+        match f.tick(t) {
+            AppStatus::Tapping { processes, .. } => {
+                let pids: Vec<i32> = processes.iter().map(|p| p.pid).collect();
+                assert_eq!(pids, [ME], "music is still heard, so not listed as left out");
+            }
+            s => panic!("{s}"),
+        }
+        assert_eq!(
+            fake.0.borrow().opened,
+            [(
+                vec![
+                    Target::AllExcept(vec![3, 12]),
+                    Target::OnDevice(vec![3], "AirPods".into()),
+                    Target::OnDevice(vec![3], SPEAKERS.into()),
+                ],
+                Mute::Unmuted
+            )]
+        );
+        // Nothing changed: the taps are left alone.
+        f.tick(t);
+        assert_eq!(fake.0.borrow().opened.len(), 1);
+
+        // It leaves the AirPods and Tussen: plain "everything" again.
+        set(&fake, vec![djay, music, me]);
+        f.tick(t);
+        let s = fake.0.borrow();
+        assert_eq!(s.opened.last().unwrap().0, [Target::AllExcept(vec![12])]);
+        assert_eq!((s.closed.as_slice(), s.live.len()), (&[1][..], 1));
+    }
+
+    #[test]
+    fn two_apps_on_tussen_and_the_speakers_share_one_scoped_tap() {
+        let (fake, mut f) = follow(AppTap::all_except([App::PlayingInto(TUSSEN.into())]));
+        let both = |p| plays(p, &[TUSSEN_IN_1, SPEAKERS]);
+        set(&fake, vec![both(proc(10, 412, DJAY, DJAY_EXE)), both(proc(3, 5, MUSIC, "/x/Music"))]);
+        f.tick(Instant::now());
+        assert_eq!(
+            fake.0.borrow().opened[0].0,
+            [Target::AllExcept(vec![3, 10]), Target::OnDevice(vec![3, 10], SPEAKERS.into())]
         );
     }
 
@@ -806,7 +954,7 @@ pub(crate) mod tests {
         assert_eq!(f.tick(t).to_string(), format!("waiting for whatever plays into {TUSSEN}*"));
         set(&fake, vec![plays(proc(10, 412, DJAY, DJAY_EXE), &[TUSSEN_IN_1])]);
         assert_eq!(f.tick(t).to_string(), "tapping djay Pro (pid 412) at 48000 Hz");
-        assert_eq!(fake.0.borrow().opened, [(Target::Processes(vec![10]), Mute::Unmuted)]);
+        assert_eq!(fake.0.borrow().opened, [(vec![Target::Processes(vec![10])], Mute::Unmuted)]);
     }
 
     #[test]

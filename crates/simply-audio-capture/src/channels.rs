@@ -69,8 +69,8 @@ pub enum ChannelState {
 pub struct ChannelsStatus {
     /// In the order they started.
     pub channels: Vec<AppChannel>,
-    /// [`Apps::Only`]: the apps asked for that aren't running (yet).
-    /// [`Apps::AllExcept`]: the exclusions that match nothing now.
+    /// [`Apps::Only`](crate::Apps::Only): the apps asked for that aren't running (yet).
+    /// [`Apps::AllExcept`](crate::Apps::AllExcept): the exclusions that match nothing now.
     pub missing: Vec<String>,
 }
 
@@ -79,6 +79,9 @@ struct Chan<T> {
     /// Order of arrival, for the status.
     seq: u64,
     tap: Option<T>,
+    /// What its tap takes in: all of the process, or (left out of some
+    /// devices) its output into each of the others.
+    targets: Vec<Target>,
     /// The sink, while no tap holds it.
     sink: Option<Sink>,
     state: ChannelState,
@@ -118,19 +121,19 @@ impl<B: Backend, S: AppSinks> Split<B, S> {
     pub(crate) fn tick(&mut self, now: Instant) -> &ChannelsStatus {
         let procs = self.backend.processes();
         let (matched, missing) = apps::resolve(&mut self.backend, &self.tap, self.this, &procs);
-        let candidates: Vec<&Proc> = apps::tapped(&self.tap.apps, &procs, &matched);
-        self.played.retain(|o, _| candidates.iter().any(|p| p.object == *o));
-        for p in candidates.iter().filter(|p| p.playing) {
-            self.played.insert(p.object, now);
+        let candidates = apps::tapped(&self.tap, self.this, &procs, &matched);
+        self.played.retain(|o, _| candidates.iter().any(|t| t.proc.object == *o));
+        for t in candidates.iter().filter(|t| t.proc.playing) {
+            self.played.insert(t.proc.object, now);
         }
-        let wanted: BTreeMap<u32, &Proc> = candidates
-            .into_iter()
-            .filter(|p| {
+        let wanted: BTreeMap<u32, (&Proc, Vec<Target>)> = candidates
+            .iter()
+            .filter(|t| {
                 self.played
-                    .get(&p.object)
-                    .is_some_and(|t| now.saturating_duration_since(*t) < CHANNEL_HOLD)
+                    .get(&t.proc.object)
+                    .is_some_and(|at| now.saturating_duration_since(*at) < CHANNEL_HOLD)
             })
-            .map(|p| (p.object, p))
+            .map(|t| (t.proc.object, (t.proc, apps::own_targets(t))))
             .collect();
 
         let gone: Vec<u32> =
@@ -141,7 +144,7 @@ impl<B: Backend, S: AppSinks> Split<B, S> {
         }
 
         let Split { backend, tap, this, sinks, chans, seq, .. } = self;
-        for (&object, p) in &wanted {
+        for (&object, (p, targets)) in &wanted {
             let chan = chans.entry(object).or_insert_with(|| {
                 let app = AppInfo::of(p, *this);
                 let sink: Sink = Box::new(sinks.started(&app));
@@ -150,23 +153,36 @@ impl<B: Backend, S: AppSinks> Split<B, S> {
                     app,
                     seq: *seq,
                     tap: None,
+                    targets: targets.clone(),
                     sink: Some(sink),
                     state: ChannelState::Failed { error: "starting".into() },
                     failed_at: None,
                 }
             });
             if let Some(t) = &chan.tap {
-                let Some(problem) = backend.health(t, p.playing) else { continue };
+                // The process moved between devices: the same channel,
+                // re-tapped where it plays now.
+                let moved = chan.targets != *targets;
+                let problem = backend.health(t, p.playing);
+                if problem.is_none() && !moved {
+                    continue;
+                }
                 let t = chan.tap.take().expect("checked above");
                 chan.sink = Some(backend.close(t));
-                chan.state = ChannelState::Failed { error: problem };
+                if let Some(problem) = problem {
+                    chan.state = ChannelState::Failed { error: problem };
+                }
+                chan.failed_at = None;
+            }
+            if chan.targets != *targets {
+                chan.targets = targets.clone();
                 chan.failed_at = None;
             }
             if chan.failed_at.is_some_and(|at| now.saturating_duration_since(at) < RETRY) {
                 continue;
             }
             let sink = chan.sink.take().expect("no tap holds the sink");
-            match backend.open(&Target::Processes(vec![object]), tap.mute, sink) {
+            match backend.open(&chan.targets, tap.mute, sink) {
                 Ok((t, device_rate)) => {
                     chan.tap = Some(t);
                     chan.state = ChannelState::Tapping { device_rate };
@@ -273,7 +289,7 @@ mod tests {
         set(&fake, vec![djay(), quiet(music()), me()]);
         assert_eq!(names(s.tick(t)), ["djay Pro 412"]);
         assert_eq!(heard.take(), ["+djay Pro", "djay Pro:2"]);
-        assert_eq!(fake.0.borrow().opened, [(Target::Processes(vec![10]), Mute::Unmuted)]);
+        assert_eq!(fake.0.borrow().opened, [(vec![Target::Processes(vec![10])], Mute::Unmuted)]);
 
         // Music starts playing: a channel of its own, djay's left alone.
         set(&fake, vec![djay(), music(), me()]);
@@ -282,7 +298,7 @@ mod tests {
         assert_eq!(st.channels[1].state, ChannelState::Tapping { device_rate: 48_000 });
         assert_eq!(heard.take(), ["+Music", "Music:2"]);
         let f = fake.0.borrow();
-        assert_eq!(f.opened.last().unwrap().0, Target::Processes(vec![3]));
+        assert_eq!(f.opened.last().unwrap().0, [Target::Processes(vec![3])]);
         assert_eq!((f.opened.len(), f.closed.len()), (2, 0));
     }
 
@@ -339,7 +355,10 @@ mod tests {
         let opened = &fake.0.borrow().opened;
         assert_eq!(
             opened.as_slice(),
-            [(Target::Processes(vec![4]), Mute::Muted), (Target::Processes(vec![10]), Mute::Muted)]
+            [
+                (vec![Target::Processes(vec![4])], Mute::Muted),
+                (vec![Target::Processes(vec![10])], Mute::Muted)
+            ]
         );
     }
 
@@ -354,6 +373,33 @@ mod tests {
         set(&fake, vec![djay(), plays(music(), &[TUSSEN_IN_1]), me]);
         assert_eq!(names(s.tick(t)), ["djay Pro 412"]);
         assert_eq!(heard.take(), ["+Music", "Music:2", "+djay Pro", "djay Pro:2", "-Music"]);
+    }
+
+    #[test]
+    fn an_app_playing_into_tussen_and_the_speakers_keeps_its_channel_on_the_speakers() {
+        let tap = AppTap::all_except([App::This, App::PlayingInto(TUSSEN.into())]);
+        let (fake, heard, mut s) = split(tap);
+        let t = Instant::now();
+        set(&fake, vec![music()]);
+        assert_eq!(names(s.tick(t)), ["Music 5"]);
+        // Music adds Tussen In 1 to the speakers: the same channel, its tap
+        // re-made on the speakers only.
+        set(&fake, vec![plays(music(), &[TUSSEN_IN_1, SPEAKERS])]);
+        let st = s.tick(t).clone();
+        assert_eq!(names(&st), ["Music 5"]);
+        assert_eq!(st.channels[0].state, ChannelState::Tapping { device_rate: 48_000 });
+        {
+            let f = fake.0.borrow();
+            assert_eq!(f.opened.last().unwrap().0, [Target::OnDevice(vec![3], SPEAKERS.into())]);
+            assert_eq!((f.opened.len(), f.closed.as_slice(), f.live.len()), (2, &[1][..], 1));
+        }
+        // Nothing changed: left alone.
+        s.tick(t);
+        assert_eq!(fake.0.borrow().opened.len(), 2);
+        // Tussen only: the channel goes. Both taps fed the one sink.
+        set(&fake, vec![plays(music(), &[TUSSEN_IN_1])]);
+        assert!(s.tick(t).channels.is_empty());
+        assert_eq!(heard.take(), ["+Music", "Music:2", "Music:2", "-Music"]);
     }
 
     #[test]
