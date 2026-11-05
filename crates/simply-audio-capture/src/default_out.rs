@@ -203,7 +203,8 @@ mod tests {
         let fake = Fake::default();
         {
             let mut s = fake.0.borrow_mut();
-            s.devices = vec![(SPEAKERS, "MacBook Pro Speakers", 44_100), (AIRPODS, "AirPods", 48_000)];
+            s.devices =
+                vec![(SPEAKERS, "MacBook Pro Speakers", 44_100), (AIRPODS, "AirPods", 48_000)];
             s.default = Some(SPEAKERS);
         }
         let got = Arc::new(Mutex::new(Vec::new()));
@@ -225,7 +226,10 @@ mod tests {
         let (fake, mut f, got) = follow();
         let t = Instant::now();
         let now = f.tick(t).unwrap().clone();
-        assert_eq!(now, Now { device: "MacBook Pro Speakers".into(), device_rate: 44_100, error: None });
+        assert_eq!(
+            now,
+            Now { device: "MacBook Pro Speakers".into(), device_rate: 44_100, error: None }
+        );
         play(&mut f, &[1.0, 1.0]);
 
         // Nothing changed: the tap is left alone.
@@ -238,7 +242,10 @@ mod tests {
         assert_eq!(now, Now { device: "AirPods".into(), device_rate: 48_000, error: None });
         {
             let s = fake.0.borrow();
-            assert_eq!((s.opened.as_slice(), s.closed.as_slice()), (&[SPEAKERS, AIRPODS][..], &[SPEAKERS][..]));
+            assert_eq!(
+                (s.opened.as_slice(), s.closed.as_slice()),
+                (&[SPEAKERS, AIRPODS][..], &[SPEAKERS][..])
+            );
             // A clean restart: the new tap is made straight after the old
             // one stops, nothing waited for in between.
             let gap = s.opened_at.unwrap() - s.closed_at.unwrap();
