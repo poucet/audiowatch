@@ -239,12 +239,13 @@ impl fmt::Display for AppStatus {
             AppStatus::Waiting { waiting_for, reason: Some(r) } => {
                 write!(f, "{r}; waiting for {waiting_for}")
             }
+            // Only an `AllExcept` tap that leaves nothing out lists none:
+            // an `Only` one taps at least one process, or waits.
+            AppStatus::Tapping { processes, device_rate, .. } if processes.is_empty() => {
+                write!(f, "tapping everything at {device_rate} Hz")
+            }
             AppStatus::Tapping { processes, device_rate, .. } => {
-                f.write_str("tapping ")?;
-                f.write_str(&join(
-                    processes.iter().map(|p| format!("{} (pid {})", p.name, p.pid)),
-                ))?;
-                write!(f, " at {device_rate} Hz")
+                write!(f, "tapping {} at {device_rate} Hz", describe(processes))
             }
             AppStatus::Failed { error } => write!(f, "tap failed: {error}"),
         }
@@ -851,7 +852,7 @@ pub(crate) mod tests {
         let (fake, mut f) = follow(AppTap::all_except([App::This]));
         let t = Instant::now();
         set(&fake, vec![proc(10, 412, DJAY, DJAY_EXE)]);
-        assert!(f.tick(t).is_tapping());
+        assert_eq!(f.tick(t).to_string(), "tapping everything at 48000 Hz");
         assert_eq!(fake.0.borrow().opened, [(vec![Target::AllExcept(vec![])], Mute::Unmuted)]);
 
         // This process starts playing, so the HAL lists it: leave it out.
