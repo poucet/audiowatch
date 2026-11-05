@@ -478,8 +478,12 @@ pub(crate) fn tapped<'a>(
     let mut taken: Vec<Tapped<'a>> =
         procs.iter().filter(|p| !matched.iter().any(|m| m.object == p.object)).map(whole).collect();
     for p in matched {
-        // Left out by who it is (`This`, a bundle, a pid): all of it.
-        if apps.iter().any(|a| !a.needs_devices() && a.matches(p, this)) {
+        // Left out by who it is (`This`, a bundle, a pid): all of it. And
+        // the follower's own process: the HAL counts the clock device of
+        // the aggregates it makes as a device it plays into (measured), so
+        // its device list moves with every re-made tap; scoping it would
+        // re-make the tap on every look.
+        if p.pid == this || apps.iter().any(|a| !a.needs_devices() && a.matches(p, this)) {
             continue;
         }
         let mut kept: Vec<String> = p
@@ -932,6 +936,17 @@ pub(crate) mod tests {
         let s = fake.0.borrow();
         assert_eq!(s.opened.last().unwrap().0, [Target::AllExcept(vec![12])]);
         assert_eq!((s.closed.as_slice(), s.live.len()), (&[1][..], 1));
+    }
+
+    #[test]
+    fn the_follower_s_own_process_is_never_scoped_only_left_out_whole() {
+        // Without `This` listed: playing into Tussen and the speakers, it
+        // is left out whole, not tapped on the speakers.
+        let (fake, mut f) = follow(AppTap::all_except([App::PlayingInto(TUSSEN.into())]));
+        let me = plays(proc(12, ME, "", "/x/simply-tussen"), &[TUSSEN_IN_1, SPEAKERS]);
+        set(&fake, vec![proc(10, 412, DJAY, DJAY_EXE), me]);
+        f.tick(Instant::now());
+        assert_eq!(fake.0.borrow().opened[0].0, [Target::AllExcept(vec![12])]);
     }
 
     #[test]

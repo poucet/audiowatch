@@ -1265,23 +1265,25 @@ mod tests {
     /// never raises the prompt:
     /// `cargo test -p simply-audio-capture two_devices -- --ignored --nocapture`.
     ///
-    /// This process plays a 997 Hz tone at -80 dBFS (inaudible) to the
-    /// default output and a 1499 Hz tone at -12 dBFS to the other device.
-    /// 1. Device-scoped taps of this process (`CATapDescription
+    /// A child process ([`tone_player`], this test binary run again) plays
+    /// a 997 Hz tone at -80 dBFS (inaudible) to the default output and a
+    /// 1499 Hz tone at -12 dBFS to the other device. (Not this process: the
+    /// aggregates a follower makes show up among its own process's devices,
+    /// which is why the follower never scopes its own process.)
+    /// 1. Device-scoped taps of the child (`CATapDescription
     ///    initWithProcesses:andDeviceUID:withStream:`): the one on the other
     ///    device hears only 1499 Hz, the one on the default output only
     ///    997 Hz; a plain process tap hears both. (Made a stereo mixdown, a
     ///    scoped tap hears both too: see [`descriptions`].)
     /// 2. "Everything except whatever plays into the other device", with a
-    ///    60 s poll: the other device's stream is made only after the
-    ///    follower started, so only the listener on this process's devices
-    ///    can make the follower re-make its taps within the 5 s allowed.
-    ///    Then it hears 997 Hz (this process's default-output part) and not
+    ///    60 s poll: the child starts its other-device stream only after
+    ///    the follower started, so only the listeners on its process can
+    ///    make the follower re-make its taps within the 5 s allowed. Then
+    ///    it hears 997 Hz (the child's default-output part) and not
     ///    1499 Hz. Other apps playing on the Mac add to what it hears.
     #[test]
     #[ignore]
     fn two_devices_a_scoped_tap_and_the_devices_listener() {
-        use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
         let _serial = REAL_TAP.lock().unwrap_or_else(|e| e.into_inner());
         if permission() != Permission::Granted {
             eprintln!("skipped: System Audio Recording is {:?}", permission());
@@ -1306,9 +1308,155 @@ mod tests {
             "default output {:?}, other device {:?} ({})",
             default.name, other.name, other.uid
         );
-        let tone = |name: &str, hz: f32, amp: f32| -> cpal::Stream {
-            let host = cpal::default_host();
-            let dev = host
+        type Heard = Arc<Mutex<Vec<f32>>>;
+        let into = |heard: &Heard| -> Sink {
+            let heard = Arc::clone(heard);
+            Box::new(move |f: &[f32], _| {
+                heard.lock().unwrap().extend(f.chunks(2).map(|c| c[0]));
+            })
+        };
+        // Amplitude of `hz` in the last second heard (Goertzel).
+        let level = |heard: &Heard, hz: f64| -> f64 {
+            let h = heard.lock().unwrap();
+            let x = &h[h.len().saturating_sub(48_000)..];
+            let k = 2.0 * (std::f64::consts::TAU * hz / 48_000.0).cos();
+            let (mut s1, mut s2) = (0.0, 0.0);
+            for &v in x {
+                let s0 = v as f64 + k * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            let power = s1 * s1 + s2 * s2 - k * s1 * s2;
+            2.0 * power.max(0.0).sqrt() / x.len().max(1) as f64
+        };
+        let (quiet, loud) = (f64::from(TONES.0 .1), f64::from(TONES.1 .1));
+
+        // 1. The API itself.
+        let mut child = Player::start(&default.name, &other.name);
+        child.far();
+        std::thread::sleep(Duration::from_millis(500));
+        let them = child.object;
+        let theirs =
+            list_processes(&mut HashMap::new(), true).into_iter().find(|p| p.object == them);
+        eprintln!("the child plays into {:?}", theirs.map(|p| p.devices));
+        let tap_for = |targets: Vec<Target>| {
+            let heard = Heard::default();
+            let kind = Kind::Processes { targets, mute: Mute::Unmuted, clock: default.clone() };
+            let tap = OutputTap::open(kind, 48_000, 2, into(&heard)).map_err(|(e, _)| e).unwrap();
+            std::thread::sleep(Duration::from_millis(1500));
+            let got = (level(&heard, 997.0), level(&heard, 1499.0));
+            drop(tap);
+            got
+        };
+        let on_other = tap_for(vec![Target::OnDevice(vec![them], other.uid.clone())]);
+        let on_default = tap_for(vec![Target::OnDevice(vec![them], default.uid.clone())]);
+        let whole = tap_for(vec![Target::Processes(vec![them])]);
+        drop(child);
+        let show = |what: &str, (a, b): (f64, f64)| {
+            eprintln!("{what}: 997 Hz {a:.2e}, 1499 Hz {b:.2e}");
+        };
+        show(&format!("scoped to {:?}", other.name), on_other);
+        show(&format!("scoped to {:?}", default.name), on_default);
+        show("whole process", whole);
+        assert!(on_other.1 > loud / 2.0 && on_other.0 < quiet / 10.0, "{on_other:?}");
+        assert!(on_default.0 > quiet / 2.0 && on_default.1 < quiet, "{on_default:?}");
+        assert!(whole.0 > quiet / 2.0 && whole.1 > loud / 2.0, "{whole:?}");
+
+        // 2. The follower, woken by the child's devices changing.
+        let ours = || -> Vec<AudioObjectID> {
+            list_devices()
+                .unwrap()
+                .iter()
+                .filter(|d| d.name == AGGREGATE_NAME)
+                .map(|d| d.id)
+                .collect()
+        };
+        let mut child = Player::start(&default.name, &other.name);
+        std::thread::sleep(Duration::from_millis(500));
+        let heard = Heard::default();
+        let tap = AppTap::all_except([crate::App::PlayingInto(other.uid.clone())]);
+        let f = Following::start_polling(tap, 48_000, 2, into(&heard), Duration::from_secs(60))
+            .unwrap();
+        assert!(f.status().is_tapping(), "{}", f.status());
+        let first = ours();
+        child.far();
+        let t = Instant::now();
+        while ours() == first {
+            assert!(t.elapsed() < Duration::from_secs(5), "not woken by the device change");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let woken = t.elapsed();
+        eprintln!(
+            "re-made {:.0} ms after the child's other-device stream started",
+            woken.as_secs_f64() * 1e3
+        );
+        std::thread::sleep(Duration::from_millis(1500));
+        let got = (level(&heard, 997.0), level(&heard, 1499.0));
+        show(&format!("everything except {:?} ({})", other.name, f.status()), got);
+        assert!(got.0 > quiet / 2.0 && got.1 < loud / 100.0, "{got:?}");
+        drop(f);
+        drop(child);
+        assert!(ours().is_empty());
+    }
+
+    /// The tones [`tone_player`] plays: (Hz, amplitude) to the default
+    /// output, and to the other device.
+    const TONES: ((f32, f32), (f32, f32)) = ((997.0, 1e-4), (1499.0, 0.25));
+
+    /// A [`tone_player`] child: plays to the default output from the start,
+    /// to the other device once told to ([`far`](Player::far)), until it is
+    /// dropped.
+    struct Player {
+        child: std::process::Child,
+        object: AudioObjectID,
+    }
+
+    impl Player {
+        fn start(near: &str, far: &str) -> Player {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tap::tests::tone_player", "--ignored", "--nocapture"])
+                .env("TONE_PLAYER", format!("{near}\n{far}"))
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let t = Instant::now();
+            let object = loop {
+                if let Some(o) = translate_pid(child.id() as i32) {
+                    break o;
+                }
+                assert!(t.elapsed() < Duration::from_secs(10), "the player never played");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            Player { child, object }
+        }
+
+        fn far(&mut self) {
+            use std::io::Write;
+            let stdin = self.child.stdin.as_mut().unwrap();
+            stdin.write_all(b"far\n").unwrap();
+            stdin.flush().unwrap();
+        }
+    }
+
+    impl Drop for Player {
+        fn drop(&mut self) {
+            drop(self.child.stdin.take()); // EOF: it stops
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Not a test: the child [`Player`] runs, playing [`TONES`] while its
+    /// stdin is open. Does nothing unless `TONE_PLAYER` names the devices.
+    #[test]
+    #[ignore]
+    fn tone_player() {
+        use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+        use std::io::BufRead;
+        let Ok(names) = std::env::var("TONE_PLAYER") else { return };
+        let (near, far) = names.split_once('\n').unwrap();
+        let tone = |name: &str, (hz, amp): (f32, f32)| -> cpal::Stream {
+            let dev = cpal::default_host()
                 .output_devices()
                 .unwrap()
                 .find(|d| crate::device_name(d).as_deref() == Some(name))
@@ -1332,101 +1480,13 @@ mod tests {
             s.play().unwrap();
             s
         };
-        type Heard = Arc<Mutex<Vec<f32>>>;
-        let into = |heard: &Heard| -> Sink {
-            let heard = Arc::clone(heard);
-            Box::new(move |f: &[f32], _| {
-                heard.lock().unwrap().extend(f.chunks(2).map(|c| c[0]));
-            })
-        };
-        // Amplitude of `hz` in the last second heard (Goertzel).
-        let level = |heard: &Heard, hz: f64| -> f64 {
-            let h = heard.lock().unwrap();
-            let x = &h[h.len().saturating_sub(48_000)..];
-            let k = 2.0 * (std::f64::consts::TAU * hz / 48_000.0).cos();
-            let (mut s1, mut s2) = (0.0, 0.0);
-            for &v in x {
-                let s0 = v as f64 + k * s1 - s2;
-                s2 = s1;
-                s1 = s0;
+        let _near = tone(near, TONES.0);
+        let mut streams = Vec::new();
+        for line in std::io::stdin().lock().lines() {
+            if line.unwrap() == "far" {
+                streams.push(tone(far, TONES.1));
             }
-            let power = s1 * s1 + s2 * s2 - k * s1 * s2;
-            2.0 * power.max(0.0).sqrt() / x.len().max(1) as f64
-        };
-        let (quiet, loud) = (1e-4f64, 0.25f64);
-
-        let _near = tone(&default.name, 997.0, quiet as f32);
-        let far = tone(&other.name, 1499.0, loud as f32);
-        std::thread::sleep(Duration::from_millis(500));
-        let me = translate_pid(std::process::id() as i32).expect("playing makes a client");
-        let mine = list_processes(&mut HashMap::new(), true).into_iter().find(|p| p.object == me);
-        eprintln!("this process plays into {:?}", mine.map(|p| p.devices));
-
-        // 1. The API itself.
-        let tap_for = |targets: Vec<Target>| {
-            let heard = Heard::default();
-            let kind = Kind::Processes { targets, mute: Mute::Unmuted, clock: default.clone() };
-            let tap = OutputTap::open(kind, 48_000, 2, into(&heard)).map_err(|(e, _)| e).unwrap();
-            std::thread::sleep(Duration::from_millis(1500));
-            let got = (level(&heard, 997.0), level(&heard, 1499.0));
-            drop(tap);
-            got
-        };
-        let on_other = tap_for(vec![Target::OnDevice(vec![me], other.uid.clone())]);
-        let on_default = tap_for(vec![Target::OnDevice(vec![me], default.uid.clone())]);
-        let whole = tap_for(vec![Target::Processes(vec![me])]);
-        eprintln!(
-            "scoped to {:?}: 997 Hz {:.2e}, 1499 Hz {:.2e}",
-            other.name, on_other.0, on_other.1
-        );
-        eprintln!(
-            "scoped to {:?}: 997 Hz {:.2e}, 1499 Hz {:.2e}",
-            default.name, on_default.0, on_default.1
-        );
-        eprintln!("whole process: 997 Hz {:.2e}, 1499 Hz {:.2e}", whole.0, whole.1);
-        assert!(on_other.1 > loud / 2.0 && on_other.0 < quiet / 10.0, "{on_other:?}");
-        assert!(on_default.0 > quiet / 2.0 && on_default.1 < quiet, "{on_default:?}");
-        assert!(whole.0 > quiet / 2.0 && whole.1 > loud / 2.0, "{whole:?}");
-
-        // 2. The follower, woken by this process's devices changing.
-        drop(far);
-        std::thread::sleep(Duration::from_millis(500));
-        let ours = || -> Vec<AudioObjectID> {
-            list_devices()
-                .unwrap()
-                .iter()
-                .filter(|d| d.name == AGGREGATE_NAME)
-                .map(|d| d.id)
-                .collect()
-        };
-        let heard = Heard::default();
-        let tap = AppTap::all_except([crate::App::PlayingInto(other.uid.clone())]);
-        let f = Following::start_polling(tap, 48_000, 2, into(&heard), Duration::from_secs(60))
-            .unwrap();
-        assert!(f.status().is_tapping(), "{}", f.status());
-        let first = ours();
-        let _far = tone(&other.name, 1499.0, loud as f32);
-        let t = Instant::now();
-        while ours() == first {
-            assert!(t.elapsed() < Duration::from_secs(5), "not woken by the device change");
-            std::thread::sleep(Duration::from_millis(5));
         }
-        eprintln!(
-            "re-made {:.0} ms after the other device's stream started",
-            t.elapsed().as_secs_f64() * 1e3
-        );
-        std::thread::sleep(Duration::from_millis(1500));
-        let got = (level(&heard, 997.0), level(&heard, 1499.0));
-        eprintln!(
-            "everything except {:?}: 997 Hz {:.2e}, 1499 Hz {:.2e}; {}",
-            other.name,
-            got.0,
-            got.1,
-            f.status()
-        );
-        assert!(got.0 > quiet / 2.0 && got.1 < loud / 100.0, "{got:?}");
-        drop(f);
-        assert!(ours().is_empty());
     }
 
     /// Make this process an audio client of the default output, with a
