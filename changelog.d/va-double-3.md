@@ -9,3 +9,7 @@ An "everything except" app tap that leaves out `App::PlayingInto` devices (Tusse
 #### "tapping everything" · 2026-11-05 06:05 · ooypyrtu
 
 An "everything except" app tap that leaves nothing out used to report `tapping  at 44100 Hz`. It now reports `tapping everything at 44100 Hz`.
+
+#### An all-except status says what it leaves out · 2026-11-05 06:09 · ssrquoty
+
+An "everything except" app tap reported the processes it left out as if they were tapped (`tapping djay Pro (pid 412) at 44100 Hz`). It now reads `tapping everything except djay Pro (pid 412) at 44100 Hz`. `AppStatus::Tapping` gains `all_except: bool`, which says which kind of tap it is. Code that builds that variant, or matches it without `..`, needs the new field.

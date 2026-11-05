@@ -215,11 +215,13 @@ pub enum AppStatus {
     /// None of the apps is running (an [`Apps::Only`] tap). `reason` says
     /// what disappeared, when one was being tapped.
     Waiting { waiting_for: String, reason: Option<String> },
-    /// Audio is flowing. `processes`: the ones tapped ([`Apps::Only`]) or
-    /// the ones left out whole ([`Apps::AllExcept`]; one left out of some
-    /// devices only is still heard on the others, so it is not listed). `missing`: the apps asked
-    /// for that aren't running (yet).
-    Tapping { processes: Vec<AppInfo>, missing: Vec<String>, device_rate: u32 },
+    /// Audio is flowing. `all_except`: which kind of tap it is, an
+    /// [`Apps::AllExcept`] one (true) or an [`Apps::Only`] one (false).
+    /// `processes`: the ones tapped ([`Apps::Only`]) or the ones left out
+    /// whole ([`Apps::AllExcept`]; one left out of some devices only is
+    /// still heard on the others, so it is not listed). `missing`: the apps
+    /// asked for that aren't running (yet).
+    Tapping { all_except: bool, processes: Vec<AppInfo>, missing: Vec<String>, device_rate: u32 },
     /// The tap could not be made; it is retried every few seconds.
     Failed { error: String },
 }
@@ -239,12 +241,15 @@ impl fmt::Display for AppStatus {
             AppStatus::Waiting { waiting_for, reason: Some(r) } => {
                 write!(f, "{r}; waiting for {waiting_for}")
             }
-            // Only an `AllExcept` tap that leaves nothing out lists none:
-            // an `Only` one taps at least one process, or waits.
-            AppStatus::Tapping { processes, device_rate, .. } if processes.is_empty() => {
+            AppStatus::Tapping { all_except: true, processes, device_rate, .. }
+                if processes.is_empty() =>
+            {
                 write!(f, "tapping everything at {device_rate} Hz")
             }
-            AppStatus::Tapping { processes, device_rate, .. } => {
+            AppStatus::Tapping { all_except: true, processes, device_rate, .. } => {
+                write!(f, "tapping everything except {} at {device_rate} Hz", describe(processes))
+            }
+            AppStatus::Tapping { all_except: false, processes, device_rate, .. } => {
                 write!(f, "tapping {} at {device_rate} Hz", describe(processes))
             }
             AppStatus::Failed { error } => write!(f, "tap failed: {error}"),
@@ -403,7 +408,12 @@ impl<B: Backend> Follow<B> {
         match self.backend.open(&key, self.tap.mute, sink) {
             Ok((tap, device_rate)) => {
                 self.failed = None;
-                self.status = AppStatus::Tapping { processes: infos.clone(), missing, device_rate };
+                self.status = AppStatus::Tapping {
+                    all_except: !only,
+                    processes: infos.clone(),
+                    missing,
+                    device_rate,
+                };
                 self.open = Some(Open { tap, key, procs: infos });
             }
             Err((e, sink)) => {
@@ -845,6 +855,27 @@ pub(crate) mod tests {
             }
             s => panic!("{s}"),
         }
+    }
+
+    #[test]
+    fn the_status_says_which_kind_of_tap_it_is() {
+        let t = Instant::now();
+        let djay = proc(10, 412, DJAY, DJAY_EXE);
+        let music = proc(3, 5, MUSIC, "/x/Music");
+
+        let (fake, mut f) = follow(AppTap::all_except([App::parse(DJAY)]));
+        set(&fake, vec![music.clone()]);
+        assert_eq!(f.tick(t).to_string(), "tapping everything at 48000 Hz");
+        set(&fake, vec![djay.clone(), music.clone()]);
+        let s = f.tick(t).clone();
+        assert_eq!(s.to_string(), "tapping everything except djay Pro (pid 412) at 48000 Hz");
+        assert!(matches!(s, AppStatus::Tapping { all_except: true, .. }));
+
+        let (fake, mut f) = follow(AppTap::only([App::parse(DJAY)]));
+        set(&fake, vec![djay, music]);
+        let s = f.tick(t).clone();
+        assert_eq!(s.to_string(), "tapping djay Pro (pid 412) at 48000 Hz");
+        assert!(matches!(s, AppStatus::Tapping { all_except: false, .. }));
     }
 
     #[test]
